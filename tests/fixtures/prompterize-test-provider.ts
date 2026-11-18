@@ -2,7 +2,8 @@
  * The outside service the prompterize tests talk to: a pi provider at the edge that plays
  * both models a typed prompt can reach. The main model answers with PROMPTERIZE_TEST_REPLY.
  * The Fixer's model (opencode-go/deepseek-v4.1-flash by default) answers with the raw text
- * in PROMPTERIZE_TEST_FIX, or fails with PROMPTERIZE_TEST_FIX_FAILURE.
+ * in PROMPTERIZE_TEST_FIX, after PROMPTERIZE_TEST_FIX_DELAY_MS milliseconds when a test sets
+ * that, or fails with PROMPTERIZE_TEST_FIX_FAILURE.
  *
  * Each model has its own stream function, so neither has to ask which model it is playing.
  * Every request is written as one JSON object a line to PROMPTERIZE_TEST_LOG, with the
@@ -29,6 +30,7 @@ const api = "prompterize-test";
 const log = process.env.PROMPTERIZE_TEST_LOG ?? "/dev/null";
 const mainReply = process.env.PROMPTERIZE_TEST_REPLY ?? "answered";
 const fixReply = process.env.PROMPTERIZE_TEST_FIX ?? '{"text":"fixed","changes":[]}';
+const fixDelay = Number(process.env.PROMPTERIZE_TEST_FIX_DELAY_MS ?? "0");
 const fixFailure = process.env.PROMPTERIZE_TEST_FIX_FAILURE;
 const extensionText = process.env.PROMPTERIZE_TEST_EXTENSION_TEXT ?? "sent by an extension";
 
@@ -81,11 +83,11 @@ function record(requested: Model<Api>, context: Context, options?: SimpleStreamO
 	);
 }
 
-/** One reply, as pi's stream of events, or the failure when `failure` is given. */
-function replyOf(requested: Model<Api>, text: string, failure?: string): AssistantMessageEventStream {
+/** One reply, as pi's stream of events, sent now or after `delayMs`, or the failure when given. */
+function replyOf(requested: Model<Api>, text: string, failure?: string, delayMs = 0): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	const reply = message(requested, text, failure);
-	queueMicrotask(() => {
+	const send = () => {
 		if (failure !== undefined) {
 			stream.push({ type: "error", reason: "error", error: reply });
 			return;
@@ -95,15 +97,17 @@ function replyOf(requested: Model<Api>, text: string, failure?: string): Assista
 		stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: reply });
 		stream.push({ type: "text_end", contentIndex: 0, content: text, partial: reply });
 		stream.push({ type: "done", reason: "stop", message: reply });
-	});
+	};
+	if (delayMs > 0) setTimeout(send, delayMs);
+	else queueMicrotask(send);
 	return stream;
 }
 
 export default function prompterizeTestProvider(pi: ExtensionAPI): void {
-	/** The Fixer's model: the reply the test set, or the failure the test asked for. */
+	/** The Fixer's model: the reply the test set, after its delay, or the failure the test asked for. */
 	const fixerStream = (requested: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
 		record(requested, context, options);
-		return replyOf(requested, fixReply, fixFailure);
+		return replyOf(requested, fixReply, fixFailure, fixDelay);
 	};
 	/** The main model: always answers, so a test can read what the main agent received. */
 	const mainStream = (requested: Model<Api>, context: Context, options?: SimpleStreamOptions) => {

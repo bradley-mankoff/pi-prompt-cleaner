@@ -1,8 +1,8 @@
 /**
  * The seam the Spec names: a real pi session that loads the extension, with a test provider
  * at the provider edge playing both the Fixer's model and the main model, under a temporary
- * HOME. A test types a prompt the way the Boss does and checks what the main model received;
- * it never reads inside the extension.
+ * HOME. A test types a prompt the way the Boss does and checks what the main model received
+ * and what the Correction log holds; it never reads inside the extension.
  *
  * pi in print mode calls session.prompt() without a source, and PromptOptions defaults that
  * source to "interactive", so a -p prompt is the typed prompt this Bead fixes (settled
@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -20,8 +20,25 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const extension = join(root, "extensions", "prompterize.ts");
 const testProvider = join(root, "tests", "fixtures", "prompterize-test-provider.ts");
 
-/** The pi arguments both session modes share: no discovery, the extension, the test provider. */
-const SHARED_ARGS = ["--no-session", "-ne", "-e", extension, "-e", testProvider, "--model", "prompterize-test/main"];
+/** The pi session id every test runs under, so a Correction log record's sessionId has a known value. */
+const SESSION_ID = "prompterize-test-session";
+
+/**
+ * The pi arguments both session modes share: no discovery, the extension, the test provider, and
+ * a session id the test knows.
+ */
+const SHARED_ARGS = [
+	"--no-session",
+	"--session-id",
+	SESSION_ID,
+	"-ne",
+	"-e",
+	extension,
+	"-e",
+	testProvider,
+	"--model",
+	"prompterize-test/main",
+];
 
 /** One request the test provider saw, as it wrote it to the log. */
 type Request = {
@@ -32,8 +49,20 @@ type Request = {
 	messages: string[];
 };
 
-/** One temporary Mac: a HOME, an agent folder, and the test provider's log. */
-type Workspace = { dir: string; home: string; agentDir: string; log: string };
+/** A git repo a test runs pi in, with the facts the Correction log should record about it. */
+type Repo = { path: string; remote: string; commit: string };
+
+/**
+ * One temporary Mac: a HOME, an agent folder, a data folder pi writes the Correction log under
+ * (XDG_DATA_HOME), a git repo with one commit to run pi in, and the test provider's log.
+ */
+type Workspace = { dir: string; home: string; agentDir: string; data: string; log: string; repo: Repo };
+
+/** What a test sets up before pi runs: the settings pi reads, and the repo's remote (null for none). */
+type WorkspaceOptions = { settings?: Record<string, unknown>; remote?: string | null };
+
+/** The remote a temporary repo has unless its test says otherwise. */
+const TEST_REMOTE = "https://example.com/boss/pi-prompterize-test.git";
 
 /** Every workspace this file made, removed once its tests are done. */
 const workspaces: Workspace[] = [];
@@ -42,23 +71,54 @@ after(() => {
 	for (const workspace of workspaces) rmSync(workspace.dir, { recursive: true, force: true });
 });
 
-/** A workspace whose agent folder holds the settings a test wants pi to read. */
-function makeWorkspace(settings?: Record<string, unknown>): Workspace {
+/** Run one git command in a test's repo and return its stdout, failing the test when git fails. */
+function git(cwd: string, args: string[]): { stdout: string } {
+	const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+	assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+	return { stdout: result.stdout };
+}
+
+/** A temporary Mac for one test: a HOME, an agent folder, a data folder, a git repo, and the test provider's log. */
+function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 	const dir = mkdtempSync(join(tmpdir(), "pi-prompterize-"));
 	const home = join(dir, "home");
 	const agentDir = join(dir, "pi-agent");
 	mkdirSync(home, { recursive: true });
 	mkdirSync(agentDir, { recursive: true });
-	if (settings !== undefined) writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
-	const workspace = { dir, home, agentDir, log: join(dir, "requests.jsonl") };
+	if (options.settings !== undefined) writeFileSync(join(agentDir, "settings.json"), JSON.stringify(options.settings));
+	writeFileSync(join(dir, "README.md"), "# a temporary repo\n");
+	git(dir, ["init", "--quiet", "--initial-branch=main"]);
+	const remote = options.remote === undefined ? TEST_REMOTE : options.remote;
+	if (remote !== null) git(dir, ["remote", "add", "origin", remote]);
+	git(dir, ["add", "README.md"]);
+	git(dir, [
+		"-c",
+		"user.name=prompterize test",
+		"-c",
+		"user.email=test@example.com",
+		"commit",
+		"--quiet",
+		"-m",
+		"the code as it was when the prompt was typed",
+	]);
+	const repo = {
+		path: git(dir, ["rev-parse", "--show-toplevel"]).stdout.trim(),
+		remote: remote ?? "",
+		commit: git(dir, ["rev-parse", "HEAD"]).stdout.trim(),
+	};
+	const workspace = { dir, home, agentDir, data: join(dir, "data"), log: join(dir, "requests.jsonl"), repo };
 	workspaces.push(workspace);
 	return workspace;
 }
 
-/** The environment a pi process runs in: a temporary HOME, the test provider's log, `extra`. */
-const piEnv = (workspace: Workspace, extra: Record<string, string>): Record<string, string | undefined> => ({
+/**
+ * The environment a pi process runs in: a temporary HOME and data folder, the test provider's
+ * log, then `extra`. A test unsets XDG_DATA_HOME by passing it as undefined.
+ */
+const piEnv = (workspace: Workspace, extra: Record<string, string | undefined>): Record<string, string | undefined> => ({
 	...process.env,
 	HOME: workspace.home,
+	XDG_DATA_HOME: workspace.data,
 	PI_CODING_AGENT_DIR: workspace.agentDir,
 	PI_SKIP_VERSION_CHECK: "1",
 	PI_OFFLINE: "1",
@@ -71,7 +131,7 @@ const piEnv = (workspace: Workspace, extra: Record<string, string>): Record<stri
 type PiOutput = { status: number | null; stdout: string; stderr: string };
 
 /** A pi session in print mode with the extension, the test provider and one typed prompt. */
-function runPi(workspace: Workspace, prompt: string, env: Record<string, string> = {}): PiOutput {
+function runPi(workspace: Workspace, prompt: string, env: Record<string, string | undefined> = {}): PiOutput {
 	const result = spawnSync("pi", [...SHARED_ARGS, "-p", prompt], {
 		cwd: workspace.dir,
 		encoding: "utf8",
@@ -81,7 +141,11 @@ function runPi(workspace: Workspace, prompt: string, env: Record<string, string>
 }
 
 /** A pi session in RPC mode, given one prompt command and run until it settles. */
-async function runRpc(workspace: Workspace, prompt: string, env: Record<string, string> = {}): Promise<PiOutput> {
+async function runRpc(
+	workspace: Workspace,
+	prompt: string,
+	env: Record<string, string | undefined> = {},
+): Promise<PiOutput> {
 	return new Promise((resolve, reject) => {
 		const child = spawn("pi", ["--mode", "rpc", ...SHARED_ARGS], {
 			cwd: workspace.dir,
@@ -147,6 +211,35 @@ function requests(workspace: Workspace): Request[] {
 /** The requests that reached one provider, which stands for one of the two models. */
 const reached = (workspace: Workspace, provider: string): Request[] =>
 	requests(workspace).filter((request) => request.provider === provider);
+
+/** One Fixer record, as the Bead names its fields. */
+type FixerRecord = {
+	id: string;
+	time: string;
+	sessionId: string;
+	repoPath: string;
+	remote: string;
+	commit: string;
+	model: string;
+	thinkingLevel: string;
+	durationMs: number;
+	outcome: string;
+	original: string;
+	fixed: string;
+	changes: { from: string; to: string }[];
+	error?: string;
+};
+
+/** Where a test's Correction log lives: under the data folder piEnv hands pi as XDG_DATA_HOME. */
+const correctionLog = (workspace: Workspace): string => join(workspace.data, "pi-prompterize", "corrections.jsonl");
+
+/** Every record in the Correction log at `path`, in the order it was written. */
+function corrections(path: string): FixerRecord[] {
+	return readFileSync(path, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as FixerRecord);
+}
 
 test("a typed prompt with typos reaches the main model as the Fixer's fixed text, with no note of what changed", () => {
 	const workspace = makeWorkspace();
@@ -248,7 +341,7 @@ test("the Fixer uses opencode-go/deepseek-v4.1-flash at low thinking by default"
 
 test("the Fixer's model and thinking level come from the prompterize settings", () => {
 	const settings = { prompterize: { fixer: { model: "opencode-go/flash", thinkingLevel: "high" } } };
-	const workspace = makeWorkspace(settings);
+	const workspace = makeWorkspace({ settings });
 	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
 	});
@@ -261,7 +354,7 @@ test("the Fixer's model and thinking level come from the prompterize settings", 
 
 test("turning the Fixer off sends typed prompts to the main model unchanged", () => {
 	const settings = { prompterize: { fixer: { enabled: false } } };
-	const workspace = makeWorkspace(settings);
+	const workspace = makeWorkspace({ settings });
 	const typed = "pleas fix teh bug in teh parser";
 	const run = runPi(workspace, typed, {
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
@@ -286,4 +379,135 @@ test("the Fixer's instructions tell its model to fix typos and change nothing el
 	assert.match(fixer[0].system, /do not reword/i);
 	assert.match(fixer[0].system, /add content/i);
 	assert.equal(fixer[0].messages.at(-1), "pleas fix teh bug in teh parser", "the model saw the prompt as typed");
+});
+
+test("a fixed prompt appends one Fixer record to the Correction log under XDG_DATA_HOME", () => {
+	const workspace = makeWorkspace();
+	const typed = "pleas fix teh bug in teh parser";
+	const fixed = "Please fix the bug in the parser.";
+	const changes = [
+		{ from: "pleas", to: "Please" },
+		{ from: "teh", to: "the" },
+	];
+	const before = Date.now();
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes }),
+		PROMPTERIZE_TEST_FIX_DELAY_MS: "50",
+	});
+	const after = Date.now();
+	assert.equal(run.status, 0, run.stderr);
+	const records = corrections(correctionLog(workspace));
+	assert.equal(records.length, 1, "the run wrote one line, one Fixer record");
+	const record = records[0];
+	assert.equal(record.outcome, "fixed");
+	assert.equal(record.original, typed, "the text as the Boss typed it");
+	assert.equal(record.fixed, fixed, "the text the main model received");
+	assert.deepEqual(record.changes, changes, "each change the Fixer made, as a from/to pair");
+	assert.equal(record.sessionId, SESSION_ID);
+	assert.equal(record.repoPath, workspace.repo.path);
+	assert.equal(record.remote, workspace.repo.remote);
+	assert.equal(record.commit, workspace.repo.commit);
+	assert.equal(record.model, "opencode-go/deepseek-v4.1-flash");
+	assert.equal(record.thinkingLevel, "low");
+	assert.match(record.id, /\S/, "the record has an id");
+	assert.ok(record.durationMs >= 50, `the Fixer call took the 50ms the test provider delayed: ${record.durationMs}`);
+	assert.ok(
+		Date.parse(record.time) >= before && Date.parse(record.time) <= after,
+		`the time is when the prompt was typed: ${record.time}`,
+	);
+	assert.equal(record.error, undefined, "a fixed run has no error");
+});
+
+test("a prompt the Fixer left as it was is logged with outcome unchanged", () => {
+	const workspace = makeWorkspace();
+	const typed = "pleas fix teh bug in teh parser";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: typed, changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const records = corrections(correctionLog(workspace));
+	assert.equal(records.length, 1);
+	assert.equal(records[0].outcome, "unchanged");
+	assert.equal(records[0].fixed, typed, "the text the main model received is the text as typed");
+});
+
+test("each Fixer run appends its own line, so the log keeps every run in order", () => {
+	const workspace = makeWorkspace();
+	const first = runPi(workspace, "pleas fix teh parser", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the parser.", changes: [] }),
+	});
+	assert.equal(first.status, 0, first.stderr);
+	const second = runPi(workspace, "pleas fix teh reader", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the reader.", changes: [] }),
+	});
+	assert.equal(second.status, 0, second.stderr);
+	const originals = corrections(correctionLog(workspace)).map((record) => record.original);
+	assert.deepEqual(originals, ["pleas fix teh parser", "pleas fix teh reader"]);
+});
+
+test("a failed Fixer call is logged with outcome error and the error's message", () => {
+	const workspace = makeWorkspace();
+	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
+		PROMPTERIZE_TEST_FIX_FAILURE: "the Fixer's model is down",
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const records = corrections(correctionLog(workspace));
+	assert.equal(records.length, 1);
+	assert.equal(records[0].outcome, "error");
+	assert.equal(records[0].error, "the Fixer's model is down");
+});
+
+test("the Correction log falls back to ~/.local/share when XDG_DATA_HOME is unset", () => {
+	const workspace = makeWorkspace();
+	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
+		XDG_DATA_HOME: undefined,
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const records = corrections(join(workspace.home, ".local", "share", "pi-prompterize", "corrections.jsonl"));
+	assert.equal(records.length, 1);
+	assert.equal(records[0].outcome, "fixed");
+});
+
+test("a skipped prompt and a slash command are not logged", () => {
+	const workspace = makeWorkspace();
+	const skipped = runPi(workspace, "*pleas fix teh bug in teh parser", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(skipped.status, 0, skipped.stderr);
+	const command = runPi(workspace, "/model prompterize-test/main", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(command.status, 0, command.stderr);
+	assert.equal(existsSync(correctionLog(workspace)), false, "neither prompt wrote a Fixer record");
+});
+
+test("a repo with no git remote logs the remote as empty and lets the fixed prompt through", () => {
+	const workspace = makeWorkspace({ remote: null });
+	const fixed = "Please fix the bug in the parser.";
+	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const records = corrections(correctionLog(workspace));
+	assert.equal(records.length, 1);
+	assert.equal(records[0].remote, "");
+	assert.equal(records[0].commit, workspace.repo.commit, "the commit is still recorded");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt still reached the main model");
+});
+
+test("a Correction log that cannot be written leaves the prompt to go on", () => {
+	const workspace = makeWorkspace();
+	const blocked = join(workspace.dir, "blocked-data-home");
+	writeFileSync(blocked, "a file where the data home's folder should be\n");
+	const fixed = "Please fix the bug in the parser.";
+	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
+		XDG_DATA_HOME: blocked,
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	assert.equal(existsSync(join(blocked, "pi-prompterize")), false, "the log could not be written");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt still reached the main model");
 });

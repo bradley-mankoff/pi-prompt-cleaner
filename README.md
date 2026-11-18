@@ -43,6 +43,40 @@ note). The `*` is stripped before the prompt goes on:
 
 The main agent receives `please leave this exactly as i typed it`.
 
+## Correction log
+
+Every Fixer run is appended to `$XDG_DATA_HOME/pi-prompterize/corrections.jsonl`, falling back
+to `~/.local/share/pi-prompterize/corrections.jsonl` when `XDG_DATA_HOME` is unset. The file
+lives outside every repo, so it can never be committed or published by accident, and a later,
+smarter model can study it. One line holds one run:
+
+```json
+{
+  "id": "5f0c6c1e-7a4e-4a6c-8d0e-2b3f1a9c7d10",
+  "time": "2026-11-18T21:16:00.000Z",
+  "sessionId": "2b7c1f4e-...",
+  "repoPath": "/Users/you/code/project",
+  "remote": "https://github.com/you/project.git",
+  "commit": "eabcbd2...",
+  "model": "opencode-go/deepseek-v4.1-flash",
+  "thinkingLevel": "low",
+  "durationMs": 812,
+  "outcome": "fixed",
+  "original": "pleas fix teh parser",
+  "fixed": "Please fix the parser.",
+  "changes": [
+    { "from": "pleas", "to": "Please" },
+    { "from": "teh", "to": "the" }
+  ]
+}
+```
+
+`outcome` is `fixed`, `unchanged` or `error`; an error record carries the failure's message in
+`error` and the prompt as typed in `fixed`. A repo with no remote records `remote` as an empty
+string. Skipped prompts, slash commands, and prompts from RPC or another extension are not
+logged. Writing the log never stops or changes a prompt: when the file cannot be written, the
+prompt still goes on.
+
 ## Settings
 
 Settings live under a `prompterize` key in pi's `settings.json`, either the global file
@@ -77,7 +111,8 @@ npm test
 
 The tests drive the seam the Spec names: a real pi session that loads the extension, with a
 test provider at the provider edge playing both the Fixer's model and the main model, under a
-temporary `HOME`. They check what the main model received, not how the extension is built.
+temporary `HOME`, `XDG_DATA_HOME` and git repo. They check what the main model received and
+what the Correction log holds, not how the extension is built.
 
 ## Where this comes from
 
