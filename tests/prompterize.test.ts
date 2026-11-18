@@ -10,11 +10,11 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { after, test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const extension = join(root, "extensions", "prompterize.ts");
@@ -203,8 +203,9 @@ async function runRpc(
 	});
 }
 
-/** Every request the test provider wrote, in order. */
+/** Every request the test provider wrote, in order. A workspace whose log is not written yet has none. */
 function requests(workspace: Workspace): Request[] {
+	if (!existsSync(workspace.log)) return [];
 	return readFileSync(workspace.log, "utf8")
 		.split("\n")
 		.filter(Boolean)
@@ -673,3 +674,297 @@ for (const { mutation, verb } of placeholderMishandlings) {
 		assert.match(records[0].error ?? "", /placeholder/i, "the record says a placeholder was mishandled");
 	});
 }
+
+/**
+ * The tests above drive pi as a `pi -p` subprocess. The status line and Esc need the interactive
+ * TUI, which a print-mode subprocess has no terminal for. The tests below run a real pi session
+ * in-process through pi's SDK, with a stand-in at pi's UI edge: it records the statuses the
+ * interactive footer would show and hands keys to the extension the way the TUI's raw input
+ * listener does. The provider fixture stays at the provider edge, exactly as above, so the checks
+ * still read what each model received and what the Correction log holds.
+ *
+ * The stand-in passes "\x1b", the bytes pi's TUI hands an extension when the Boss presses Esc, so
+ * these tests drive Esc itself; no manual interactive check is needed.
+ */
+
+/** The slice of pi's SDK the in-process tests use. */
+type PiSdk = {
+	createAgentSession(options: Record<string, unknown>): Promise<{ session: SdkSession }>;
+	DefaultResourceLoader: new (options: Record<string, unknown>) => {
+		reload(): Promise<void>;
+		getExtensions(): { errors: unknown[] };
+	};
+	SessionManager: { inMemory(cwd: string): unknown };
+	SettingsManager: { create(cwd: string, agentDir: string): unknown };
+};
+
+/** The session operations the in-process tests use. */
+type SdkSession = {
+	bindExtensions(bindings: { uiContext: unknown; mode: string }): Promise<void>;
+	prompt(text: string): Promise<void>;
+	dispose(): void;
+};
+
+/** The installed pi package, found from the `pi` binary on PATH, so the tests use the same pi as the CLI. */
+function piPackageRoot(): string {
+	const bin = (process.env.PATH ?? "")
+		.split(delimiter)
+		.map((directory) => join(directory, "pi"))
+		.find((path) => existsSync(path));
+	if (bin === undefined) throw new Error("pi is not on PATH");
+	for (let directory = dirname(realpathSync(bin)); ; directory = dirname(directory)) {
+		const manifest = join(directory, "package.json");
+		if (existsSync(manifest)) {
+			const { name } = JSON.parse(readFileSync(manifest, "utf8")) as { name?: string };
+			if (name === "@earendil-works/pi-coding-agent") return directory;
+		}
+		if (dirname(directory) === directory) throw new Error(`the package that holds ${bin} is not on disk`);
+	}
+}
+
+/** pi's SDK, loaded once from the installed package. */
+let piSdk: Promise<PiSdk> | undefined;
+const loadPiSdk = (): Promise<PiSdk> =>
+	(piSdk ??= import(pathToFileURL(join(piPackageRoot(), "dist", "index.js")).href).then((module) => module as PiSdk));
+
+/** The main model the in-process session runs, as the test provider registers it. */
+const MAIN_MODEL = {
+	id: "main",
+	name: "main",
+	api: "prompterize-test",
+	provider: "prompterize-test",
+	baseUrl: "http://localhost:0",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 100_000,
+	maxTokens: 4096,
+};
+
+/** One status the TUI was asked to show, and how many Fixer requests had been recorded when it changed. */
+type StatusChange = { key: string; text: string | undefined; fixerRequests: number };
+
+/** pi's UI port as a test sees it: the statuses the footer would show, and the keys the editor receives. */
+type TestTui = {
+	statuses: StatusChange[];
+	ui: Record<string, unknown>;
+	/** Hand a key to pi's terminal input listeners, as the TUI does. */
+	press(data: string): void;
+};
+
+/** The TUI stand-in: it records status changes and lets a test press a key. */
+function makeTestTui(workspace: Workspace): TestTui {
+	const statuses: StatusChange[] = [];
+	const inputHandlers = new Set<(data: string) => { consume?: boolean } | undefined>();
+	const ui: Record<string, unknown> = {
+		select: async () => undefined,
+		confirm: async () => false,
+		input: async () => undefined,
+		notify: () => {},
+		onTerminalInput(handler: (data: string) => { consume?: boolean } | undefined) {
+			inputHandlers.add(handler);
+			return () => inputHandlers.delete(handler);
+		},
+		setStatus(key: string, text: string | undefined) {
+			statuses.push({ key, text, fixerRequests: reached(workspace, "opencode-go").length });
+		},
+		setWorkingMessage: () => {},
+		setWorkingVisible: () => {},
+		setWorkingIndicator: () => {},
+		setHiddenThinkingLabel: () => {},
+		setWidget: () => {},
+		setFooter: () => {},
+		setHeader: () => {},
+		setTitle: () => {},
+		custom: async () => undefined,
+		pasteToEditor: () => {},
+		setEditorText: () => {},
+		getEditorText: () => "",
+		editor: async () => undefined,
+		addAutocompleteProvider: () => {},
+		setEditorComponent: () => {},
+		getEditorComponent: () => undefined,
+		theme: {},
+		getAllThemes: () => [],
+		getTheme: () => undefined,
+		setTheme: () => ({ success: false, error: "no theme in the test's UI" }),
+		getToolsExpanded: () => false,
+		setToolsExpanded: () => {},
+	};
+	return {
+		statuses,
+		ui,
+		press(data) {
+			for (const handler of [...inputHandlers]) handler(data);
+		},
+	};
+}
+
+/** Wait for something a session does in the background, failing the test rather than hanging forever. */
+async function waitFor(condition: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+/** What a test sets beyond the workspace: the extension's environment, and work to do while the Fixer runs. */
+type InteractiveOptions = {
+	env?: Record<string, string | undefined>;
+	duringFixer?: (tui: TestTui) => Promise<void> | void;
+};
+
+/**
+ * Run one typed prompt through a real pi session in-process, with the TUI stand-in at the UI edge.
+ * The environment is swapped for the session's duration and restored afterwards, so each test
+ * starts clean even though the process is shared.
+ */
+async function runInteractiveSession(
+	workspace: Workspace,
+	typed: string,
+	options: InteractiveOptions = {},
+): Promise<TestTui> {
+	const savedEnvironment = { ...process.env };
+	for (const [key, value] of Object.entries(piEnv(workspace, options.env ?? {}))) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	const tui = makeTestTui(workspace);
+	let session: SdkSession | undefined;
+	try {
+		const sdk = await loadPiSdk();
+		const loader = new sdk.DefaultResourceLoader({
+			cwd: workspace.dir,
+			agentDir: workspace.agentDir,
+			additionalExtensionPaths: [extension, testProvider],
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+		});
+		await loader.reload();
+		assert.deepEqual(loader.getExtensions().errors, [], "the extension and test provider loaded");
+		session = (
+			await sdk.createAgentSession({
+				cwd: workspace.dir,
+				agentDir: workspace.agentDir,
+				model: MAIN_MODEL,
+				resourceLoader: loader,
+				sessionManager: sdk.SessionManager.inMemory(workspace.dir),
+				settingsManager: sdk.SettingsManager.create(workspace.dir, workspace.agentDir),
+			})
+		).session;
+		await session.bindExtensions({ uiContext: tui.ui, mode: "tui" });
+		const prompt = session.prompt(typed);
+		if (options.duringFixer !== undefined) {
+			await waitFor(() => reached(workspace, "opencode-go").length === 1, "the Fixer's model request");
+			await options.duringFixer(tui);
+		}
+		await prompt;
+	} finally {
+		session?.dispose();
+		for (const key of Object.keys(process.env)) {
+			if (!(key in savedEnvironment)) delete process.env[key];
+		}
+		Object.assign(process.env, savedEnvironment);
+	}
+	return tui;
+}
+
+test("pi shows the fixing prompt… status while the Fixer's model call runs and clears it when the call succeeds", async () => {
+	const workspace = makeWorkspace();
+	const tui = await runInteractiveSession(workspace, "pleas fix teh bug in teh parser", {
+		env: {
+			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+			PROMPTERIZE_TEST_FIX_DELAY_MS: "150",
+		},
+		duringFixer: (running) => {
+			assert.deepEqual(
+				running.statuses.at(-1),
+				{ key: "prompterize", text: "fixing prompt…", fixerRequests: 0 },
+				"the status was shown before the Fixer's model request",
+			);
+		},
+	});
+	assert.deepEqual(
+		tui.statuses,
+		[
+			{ key: "prompterize", text: "fixing prompt…", fixerRequests: 0 },
+			{ key: "prompterize", text: undefined, fixerRequests: 1 },
+		],
+		"the status was cleared once the call ended",
+	);
+});
+
+test("pi clears the fixing prompt… status when the Fixer's model call fails", async () => {
+	const workspace = makeWorkspace();
+	const tui = await runInteractiveSession(workspace, "pleas fix teh bug in teh parser", {
+		env: {
+			PROMPTERIZE_TEST_FIX_FAILURE: "the Fixer's model is down",
+			PROMPTERIZE_TEST_FIX_DELAY_MS: "100",
+		},
+		duringFixer: (running) => {
+			assert.equal(running.statuses.at(-1)?.text, "fixing prompt…", "the status is shown while the failing call runs");
+		},
+	});
+	assert.deepEqual(tui.statuses.map(({ text }) => text), ["fixing prompt…", undefined], "the status was cleared after the failure");
+});
+
+test("pi clears the fixing prompt… status when Esc cancels the Fixer's model call", async () => {
+	const workspace = makeWorkspace();
+	const tui = await runInteractiveSession(workspace, "pleas fix teh bug in teh parser", {
+		env: {
+			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+			PROMPTERIZE_TEST_FIX_DELAY_MS: "2000",
+		},
+		duringFixer: (running) => {
+			assert.equal(running.statuses.at(-1)?.text, "fixing prompt…", "the status is shown while the call runs");
+			running.press("\x1b");
+		},
+	});
+	assert.deepEqual(tui.statuses.map(({ text }) => text), ["fixing prompt…", undefined], "the status was cleared after the cancellation");
+});
+
+test("Esc during the Fixer's model call sends the original prompt to the main model and the Correction log records cancelled with the time waited", async () => {
+	const workspace = makeWorkspace();
+	const typed = "pleas fix teh bug in teh parser";
+	await runInteractiveSession(workspace, typed, {
+		env: {
+			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+			PROMPTERIZE_TEST_FIX_DELAY_MS: "2000",
+		},
+		duringFixer: async (running) => {
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			running.press("\x1b");
+		},
+	});
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1, "the prompt reached the main model once");
+	assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt exactly as typed");
+	const records = correctionRecords(correctionLog(workspace));
+	assert.equal(records.length, 1, "the cancelled run wrote one Fixer record");
+	assert.equal(records[0].outcome, "cancelled");
+	assert.equal(records[0].original, typed);
+	assert.equal(records[0].fixed, typed, "the log holds the text the main model received");
+	assert.deepEqual(records[0].changes, []);
+	assert.equal(records[0].error, undefined);
+	assert.ok(records[0].durationMs >= 200, `the log records the time waited: ${records[0].durationMs}ms`);
+});
+
+test("a Fixer call longer than three seconds is still waited for, and its fix reaches the main model", async () => {
+	const workspace = makeWorkspace();
+	const fixed = "Please fix the bug in the parser.";
+	await runInteractiveSession(workspace, "pleas fix teh bug in teh parser", {
+		env: {
+			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [] }),
+			PROMPTERIZE_TEST_FIX_DELAY_MS: "3200",
+		},
+	});
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the main model received the fix from the slow call");
+	const records = correctionRecords(correctionLog(workspace));
+	assert.equal(records.length, 1);
+	assert.equal(records[0].outcome, "fixed");
+	assert.ok(records[0].durationMs >= 3000, `the slow call was waited for: ${records[0].durationMs}ms`);
+});

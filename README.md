@@ -31,6 +31,11 @@ as are slash commands.
 The Fixer has no timeout. If its model call fails, or the reply cannot be used, the prompt
 goes on unchanged, so a broken Fixer never blocks your work.
 
+While the Fixer waits on its model, pi's status line shows **fixing prompt…**, so you know pi is
+busy rather than stuck. Press Esc to cancel the call: the prompt goes on exactly as you typed it,
+and the Correction log records the run as `cancelled` with the time you waited. The status is
+cleared however the call ends.
+
 ### Protected spans
 
 Text you wrote or chose on purpose is never the Fixer's to change. Before its model call, the
@@ -108,11 +113,12 @@ smarter model can study it. One line holds one run:
 }
 ```
 
-`outcome` is `fixed`, `unchanged` or `error`; an error record carries the failure's message in
-`error` and the prompt as typed in `fixed`. A repo with no remote records `remote` as an empty
-string. Skipped prompts, slash commands, and prompts from RPC or another extension are not
-logged. Writing the log never stops or changes a prompt: when the file cannot be written, the
-prompt still goes on.
+`outcome` is `fixed`, `unchanged`, `error` or `cancelled`; an error record carries the failure's
+message in `error` and the prompt as typed in `fixed`. A cancelled record carries the prompt as
+typed in `fixed`, no error, and the time waited in `durationMs`. A repo with no remote records
+`remote` as an empty string. Skipped prompts, slash commands, and prompts from RPC or another
+extension are not logged. Writing the log never stops or changes a prompt: when the file cannot be
+written, the prompt still goes on.
 
 ## Settings
 
@@ -154,6 +160,10 @@ The tests drive the seam the Spec names: a real pi session that loads the extens
 test provider at the provider edge playing both the Fixer's model and the main model, under a
 temporary `HOME`, `XDG_DATA_HOME` and git repo. They check what the main model received,
 including the Clarity note, and what the Correction log holds, not how the extension is built.
+
+The status line and Esc need an interactive session. Their tests run the same pi session
+in-process through pi's SDK, with a stand-in at pi's UI edge that records the statuses the
+footer would show and presses Esc; the provider fixture stays at the provider edge.
 
 ## Where this comes from
 

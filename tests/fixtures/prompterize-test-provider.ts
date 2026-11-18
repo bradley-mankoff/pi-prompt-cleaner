@@ -19,6 +19,10 @@
  * provider, model, thinking level, system prompt and message text, so a test can see what
  * each model received without reading inside the extension.
  *
+ * The settings above are read at request time, not at load time, so an in-process test can run
+ * one pi session per case through a fresh environment. A request whose signal aborts ends with
+ * an aborted message, as a real provider does when pi aborts the call.
+ *
  * It also registers one command, /prompterize-test-extension, which sends
  * PROMPTERIZE_TEST_EXTENSION_TEXT as a prompt from an extension. A test uses it to show
  * that an extension's prompt reaches the main model without visiting the Fixer.
@@ -50,14 +54,18 @@ function placeholderMutation(name: string | undefined): PlaceholderMutation | un
 }
 
 const api = "prompterize-test";
-const log = process.env.PROMPTERIZE_TEST_LOG ?? "/dev/null";
-const mainReply = process.env.PROMPTERIZE_TEST_REPLY ?? "answered";
-const fixReply = process.env.PROMPTERIZE_TEST_FIX ?? '{"text":"fixed","changes":[]}';
-const fixSubstitutions = process.env.PROMPTERIZE_TEST_FIX_SUBSTITUTIONS;
-const fixPlaceholderMutation = placeholderMutation(process.env.PROMPTERIZE_TEST_FIX_PLACEHOLDER_MUTATION);
-const fixDelay = Number(process.env.PROMPTERIZE_TEST_FIX_DELAY_MS ?? "0");
-const fixFailure = process.env.PROMPTERIZE_TEST_FIX_FAILURE;
-const extensionText = process.env.PROMPTERIZE_TEST_EXTENSION_TEXT ?? "sent by an extension";
+
+/** One test setting, read at request time so a fresh environment per test is enough. */
+const setting = (name: string, fallback: string): string => process.env[name] ?? fallback;
+
+const mainReply = (): string => setting("PROMPTERIZE_TEST_REPLY", "answered");
+const fixReply = (): string => setting("PROMPTERIZE_TEST_FIX", '{"text":"fixed","changes":[]}');
+const fixSubstitutions = (): string | undefined => process.env.PROMPTERIZE_TEST_FIX_SUBSTITUTIONS;
+const fixPlaceholderMutation = (): PlaceholderMutation | undefined =>
+	placeholderMutation(process.env.PROMPTERIZE_TEST_FIX_PLACEHOLDER_MUTATION);
+const fixDelay = (): number => Number(process.env.PROMPTERIZE_TEST_FIX_DELAY_MS ?? "0");
+const fixFailure = (): string | undefined => process.env.PROMPTERIZE_TEST_FIX_FAILURE;
+const extensionText = (): string => setting("PROMPTERIZE_TEST_EXTENSION_TEXT", "sent by an extension");
 
 /**
  * The placeholders the Fixer's request carries: the protected spans the extension swapped out.
@@ -70,15 +78,17 @@ const placeholderPattern = /⟦prompterize:[0-9a-f]+:\d+⟧/g;
  * model received, because only then does the reply carry the random placeholders of this request.
  */
 function fixReplyFor(prompt: string): string {
-	if (fixSubstitutions !== undefined) {
-		const substitutions = JSON.parse(fixSubstitutions) as { from: string; to: string }[];
-		const text = substitutions.reduce((current, { from, to }) => current.split(from).join(to), prompt);
-		return JSON.stringify({ text, changes: substitutions });
+	const substitutions = fixSubstitutions();
+	if (substitutions !== undefined) {
+		const pairs = JSON.parse(substitutions) as { from: string; to: string }[];
+		const text = pairs.reduce((current, { from, to }) => current.split(from).join(to), prompt);
+		return JSON.stringify({ text, changes: pairs });
 	}
-	if (fixPlaceholderMutation !== undefined) {
-		return JSON.stringify({ text: mutatePlaceholder(prompt, fixPlaceholderMutation), changes: [] });
+	const mutation = fixPlaceholderMutation();
+	if (mutation !== undefined) {
+		return JSON.stringify({ text: mutatePlaceholder(prompt, mutation), changes: [] });
 	}
-	return fixReply;
+	return fixReply();
 }
 
 /** A reply that mishandles the first placeholder, as a model that ignored its guard would. */
@@ -118,7 +128,12 @@ const model = (id: string) => ({
 });
 
 /** One assistant message, carrying either its text or, when `failure` is given, that error. */
-const message = (requested: Model<Api>, text: string, failure?: string): AssistantMessage => ({
+const message = (
+	requested: Model<Api>,
+	text: string,
+	failure?: string,
+	stopReason: "error" | "aborted" = "error",
+): AssistantMessage => ({
 	role: "assistant",
 	content: failure === undefined ? [{ type: "text", text }] : [],
 	api: requested.api,
@@ -132,7 +147,7 @@ const message = (requested: Model<Api>, text: string, failure?: string): Assista
 		totalTokens: 2,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	},
-	stopReason: failure === undefined ? "stop" : "error",
+	stopReason: failure === undefined ? "stop" : stopReason,
 	...(failure === undefined ? {} : { errorMessage: failure }),
 	timestamp: Date.now(),
 });
@@ -152,7 +167,7 @@ function systemOf(context: Context): string {
 /** The one request the log records, so a test can see what a model was sent. */
 function record(requested: Model<Api>, context: Context, options?: SimpleStreamOptions): void {
 	appendFileSync(
-		log,
+		setting("PROMPTERIZE_TEST_LOG", "/dev/null"),
 		`${JSON.stringify({
 			provider: requested.provider,
 			model: requested.id,
@@ -163,11 +178,30 @@ function record(requested: Model<Api>, context: Context, options?: SimpleStreamO
 	);
 }
 
-/** One reply, as pi's stream of events, sent after `delayMs` (`0` sends it next tick), or the failure when given. */
-function replyOf(requested: Model<Api>, text: string, failure?: string, delayMs = 0): AssistantMessageEventStream {
+/**
+ * One reply, as pi's stream of events, sent after `delayMs` (`0` sends it next tick), or the failure
+ * when given. When `signal` aborts first, the reply is an aborted message, as a real provider's is.
+ */
+function replyOf(
+	requested: Model<Api>,
+	text: string,
+	failure?: string,
+	delayMs = 0,
+	signal?: AbortSignal,
+): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	const reply = message(requested, text, failure);
-	const send = () => {
+	const aborted = message(requested, "", "the Fixer's call was cancelled", "aborted");
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let settled = false;
+	function stop() {
+		settled = true;
+		if (timer !== undefined) clearTimeout(timer);
+		signal?.removeEventListener("abort", onAbort);
+	}
+	function send() {
+		if (settled) return;
+		stop();
 		if (failure !== undefined) {
 			stream.push({ type: "error", reason: "error", error: reply });
 			return;
@@ -177,8 +211,15 @@ function replyOf(requested: Model<Api>, text: string, failure?: string, delayMs 
 		stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: reply });
 		stream.push({ type: "text_end", contentIndex: 0, content: text, partial: reply });
 		stream.push({ type: "done", reason: "stop", message: reply });
-	};
-	setTimeout(send, delayMs);
+	}
+	function onAbort() {
+		if (settled) return;
+		stop();
+		stream.push({ type: "error", reason: "aborted", error: aborted });
+	}
+	if (signal?.aborted) queueMicrotask(onAbort);
+	else signal?.addEventListener("abort", onAbort, { once: true });
+	timer = setTimeout(send, delayMs);
 	return stream;
 }
 
@@ -186,12 +227,12 @@ export default function prompterizeTestProvider(pi: ExtensionAPI): void {
 	/** The Fixer's model: the reply the test set, after its delay, or the failure the test asked for. */
 	const fixerStream = (requested: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
 		record(requested, context, options);
-		return replyOf(requested, fixReplyFor(promptOf(context)), fixFailure, fixDelay);
+		return replyOf(requested, fixReplyFor(promptOf(context)), fixFailure(), fixDelay(), options?.signal);
 	};
 	/** The main model: always answers, so a test can read what the main agent received. */
 	const mainStream = (requested: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
 		record(requested, context, options);
-		return replyOf(requested, mainReply);
+		return replyOf(requested, mainReply(), undefined, 0, options?.signal);
 	};
 
 	pi.registerProvider(fixerProvider, {
@@ -214,7 +255,7 @@ export default function prompterizeTestProvider(pi: ExtensionAPI): void {
 	pi.registerCommand("prompterize-test-extension", {
 		description: "Send a prompt from an extension, as another extension would",
 		handler: async () => {
-			pi.sendUserMessage(extensionText);
+			pi.sendUserMessage(extensionText());
 		},
 	});
 }
