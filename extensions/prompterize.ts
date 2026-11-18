@@ -3,10 +3,18 @@
  * typos before the main agent reads it. The Boss's words are the only thing that changes;
  * nothing is added to the prompt to say what changed.
  *
+ * Each Fixer run also goes to the Correction log, one JSONL file outside every repo, for a
+ * later, smarter model to study the Boss's typing. The log is a study aid: when it cannot be
+ * written, the prompt still goes on.
+ *
  * The seam is the real pi session (see tests/prompterize.test.ts): this file only wires pi's
  * `input` event to the Fixer, and the Fixer speaks to its model through
  * `ctx.modelRegistry.streamSimple()`, so pi's own credentials are used.
  */
+import { randomUUID } from "node:crypto";
+import { appendFile, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
 
@@ -40,6 +48,37 @@ type FixerChange = { from: string; to: string };
 
 /** What the Fixer's model replies with: the prompt after fixing, and each change it made. */
 type FixerReply = { text: string; changes: FixerChange[] };
+
+/** How a Fixer run ended, as the Correction log records it. */
+type FixerOutcome = "fixed" | "unchanged" | "error" | "cancelled";
+
+/** One Fixer run: when it started, how long its model call took, and what came of it. */
+type FixerRun = {
+	/** When the Boss's prompt arrived, ISO 8601. */
+	time: string;
+	/** How long the Fixer's model call took, in milliseconds. */
+	durationMs: number;
+	outcome: FixerOutcome;
+	/** The text the prompt goes on as: the reply's, or the prompt as typed when the run failed. */
+	fixed: string;
+	changes: FixerChange[];
+	error?: string;
+};
+
+/**
+ * One Fixer run as the Correction log keeps it: the run itself, plus where and with what it
+ * ran and the text it started from.
+ */
+type FixerRecord = FixerRun & {
+	id: string;
+	sessionId: string;
+	repoPath: string;
+	remote: string;
+	commit: string;
+	model: string;
+	thinkingLevel: ThinkingLevel;
+	original: string;
+};
 
 const INSTRUCTIONS = `You are the Fixer in pi-prompterize. Fix the spelling mistakes in the user's prompt.
 
@@ -90,24 +129,97 @@ function parseReply(raw: string): FixerReply {
 }
 
 /**
- * Send one prompt to the Fixer's model and return its fixed text and changes. Any failure
- * throws; the input handler lets the prompt through unchanged when that happens.
+ * Send one prompt to the Fixer's model and return what the run did to it. The result is total:
+ * a failure comes back as the error outcome, so the caller never has to catch one.
  */
-async function fixPrompt(
+async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerSettings): Promise<FixerRun> {
+	const started = Date.now();
+	const time = new Date(started).toISOString();
+	try {
+		const { provider, id } = splitModel(settings.model);
+		const model: Model<Api> | undefined = ctx.modelRegistry.find(provider, id);
+		if (!model) throw new Error(`the Fixer's model ${settings.model} is not available`);
+		const context: Context = {
+			systemPrompt: INSTRUCTIONS,
+			messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: started }],
+		};
+		const reply = await ctx.modelRegistry.streamSimple(model, context, { reasoning: settings.thinkingLevel }).result();
+		if (reply.stopReason !== "stop") throw new Error(reply.errorMessage ?? `the Fixer stopped with ${reply.stopReason}`);
+		const fixed = parseReply(textOf(reply));
+		return {
+			time,
+			durationMs: Date.now() - started,
+			outcome: fixed.text === prompt ? "unchanged" : "fixed",
+			fixed: fixed.text,
+			changes: fixed.changes,
+		};
+	} catch (failure) {
+		return {
+			time,
+			durationMs: Date.now() - started,
+			outcome: "error",
+			fixed: prompt,
+			changes: [],
+			error: failure instanceof Error ? failure.message : String(failure),
+		};
+	}
+}
+
+/** The Correction log's one file, outside every repo: under XDG_DATA_HOME, or ~/.local/share. */
+function correctionLogPath(): string {
+	const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+	return join(dataHome, "pi-prompterize", "corrections.jsonl");
+}
+
+/** The repo a prompt was typed in, so a correction can be judged against the code as it was then. */
+type RepoFacts = { repoPath: string; remote: string; commit: string };
+
+/**
+ * The repo's path, its first remote's URL and its current commit, asked of git in `cwd`. A
+ * folder git does not know, or a repo with no remote, gives an empty field instead of a failure.
+ */
+async function repoFacts(pi: ExtensionAPI, cwd: string): Promise<RepoFacts> {
+	const pathAndCommit = await pi.exec("git", ["rev-parse", "--show-toplevel", "HEAD"], { cwd });
+	if (pathAndCommit.code !== 0) return { repoPath: cwd, remote: "", commit: "" };
+	// One call answers both questions, one line each: the repo's top level, then HEAD.
+	const [repoPath, commit = ""] = pathAndCommit.stdout.trim().split("\n");
+	const remoteNames = await pi.exec("git", ["remote"], { cwd });
+	const remoteName = remoteNames.stdout.split("\n").find((name) => name.trim().length > 0);
+	if (remoteName === undefined) return { repoPath, remote: "", commit };
+	const url = await pi.exec("git", ["remote", "get-url", remoteName.trim()], { cwd });
+	return { repoPath, remote: url.code === 0 ? url.stdout.trim() : "", commit };
+}
+
+/**
+ * Append one Fixer record to the Correction log. The log is a study aid, so a log that cannot
+ * be made or written is dropped: whatever the log does, the Boss's prompt still goes on.
+ */
+async function logFixerRun(
+	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	prompt: string,
 	settings: FixerSettings,
-): Promise<FixerReply> {
-	const { provider, id } = splitModel(settings.model);
-	const model: Model<Api> | undefined = ctx.modelRegistry.find(provider, id);
-	if (!model) throw new Error(`the Fixer's model ${settings.model} is not available`);
-	const context: Context = {
-		systemPrompt: INSTRUCTIONS,
-		messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
-	};
-	const reply = await ctx.modelRegistry.streamSimple(model, context, { reasoning: settings.thinkingLevel }).result();
-	if (reply.stopReason !== "stop") throw new Error(reply.errorMessage ?? `the Fixer stopped with ${reply.stopReason}`);
-	return parseReply(textOf(reply));
+	original: string,
+	run: FixerRun,
+): Promise<void> {
+	try {
+		const { repoPath, remote, commit } = await repoFacts(pi, ctx.cwd);
+		const record: FixerRecord = {
+			id: randomUUID(),
+			sessionId: ctx.sessionManager.getSessionId(),
+			repoPath,
+			remote,
+			commit,
+			model: settings.model,
+			thinkingLevel: settings.thinkingLevel,
+			original,
+			...run,
+		};
+		const path = correctionLogPath();
+		await mkdir(dirname(path), { recursive: true });
+		await appendFile(path, `${JSON.stringify(record)}\n`, "utf8");
+	} catch {
+		// A Correction log that cannot be written never stops or changes the prompt.
+	}
 }
 
 export default function prompterize(pi: ExtensionAPI): void {
@@ -120,12 +232,8 @@ export default function prompterize(pi: ExtensionAPI): void {
 		if (event.text.startsWith("*")) return { action: "transform", text: event.text.slice(1) };
 		const settings = fixerSettings(pi.getSettings());
 		if (!settings.enabled) return { action: "continue" };
-		try {
-			const fixed = await fixPrompt(ctx, event.text, settings);
-			return fixed.text === event.text ? { action: "continue" } : { action: "transform", text: fixed.text };
-		} catch {
-			// A broken Fixer never blocks the Boss's work.
-			return { action: "continue" };
-		}
+		const run = await fixPrompt(ctx, event.text, settings);
+		await logFixerRun(pi, ctx, settings, event.text, run);
+		return run.outcome === "fixed" ? { action: "transform", text: run.fixed } : { action: "continue" };
 	});
 }
