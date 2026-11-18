@@ -141,6 +141,33 @@ typed in `fixed`, no error, and the time waited in `durationMs`. A repo with no 
 extension are not logged. Writing the log never stops or changes a prompt: when the file cannot be
 written, the prompt still goes on.
 
+When the Clarity note leads the main agent to ask a Question round, the Boss's next typed prompt
+is its answer, and the round is appended to the same file as a Question round record. The round is
+recognised by the grilling skill's `❓ **Q` marker in the agent's final reply. One line holds one
+round:
+
+```json
+{
+  "id": "9a1d7c2e-3f5b-4d8a-9c1e-6b0f2a4d8e13",
+  "fixerRecordId": "5f0c6c1e-7a4e-4a6c-8d0e-2b3f1a9c7d10",
+  "prompt": "fix the parser",
+  "questions": [
+    "❓ **Q1** - **Which parser?**\n\nThe repo has two parsers.\n\nShould I change the JSON parser?\n\n➡️ Yes, change the JSON parser.",
+    "❓ **Q2** - **Which call site?**\n\nI found two callers.\n\nShould I change both?\n\n➡️ Yes, change both."
+  ],
+  "answers": "yes",
+  "repoPath": "/Users/you/code/project",
+  "remote": "https://github.com/you/project.git",
+  "commit": "eabcbd2..."
+}
+```
+
+`fixerRecordId` is the id of the Fixer record for the prompt that caused the round, so the two can
+be studied together. With the Fixer off there is no such record, so that field is left out and
+`prompt` holds the prompt itself. Each question keeps its body and suggested answer. A slash
+command, or a prompt from RPC or another extension, is not the Boss's next typed prompt, so the
+record waits for the next one.
+
 ## Settings
 
 Settings live under a `prompterize` key in pi's `settings.json`, either the global file

@@ -8,9 +8,10 @@
  * so the main agent knows to act at once on a clear prompt and to ask one Question round
  * when it is unclear.
  *
- * Each Fixer run also goes to the Correction log, one JSONL file outside every repo, for a
- * later, smarter model to study the Boss's typing. The log is a study aid: when it cannot be
- * written, the prompt still goes on.
+ * Each Fixer run, and each Question round the Clarity note leads to, also goes to the Correction
+ * log, one JSONL file outside every repo, for a later, smarter model to study the Boss's typing
+ * and his unclear prompts. The log is a study aid: when it cannot be written, the prompt still
+ * goes on.
  *
  * Text the Boss wrote or chose on purpose is never the Fixer's to change: each code fence, inline
  * code span, blockquote line, URL and @ reference is swapped for a random placeholder before the
@@ -23,9 +24,9 @@
  * time waited. The status is cleared however the call ends.
  *
  * The seam is the real pi session (see tests/prompterize.test.ts): this file wires pi's
- * `input` and `before_agent_start` events to the Fixer and the Clarity note, and the Fixer
- * speaks to its model through `ctx.modelRegistry.streamSimple()`, so pi's own credentials
- * are used.
+ * `input`, `before_agent_start` and `agent_end` events to the Fixer, the Clarity note and the
+ * Correction log, and the Fixer speaks to its model through `ctx.modelRegistry.streamSimple()`,
+ * so pi's own credentials are used.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
@@ -145,6 +146,28 @@ type FixerRecord = FixerRun & {
 	original: string;
 };
 
+/**
+ * The prompt that caused a Question round: the id of its Fixer record when the Fixer ran, or no
+ * id when the Fixer is off. The prompt itself is kept either way, so a study of the log can read
+ * which prompt was unclear without first finding the Fixer record.
+ */
+type QuestionRoundCause = { fixerRecordId?: string; prompt: string };
+
+/**
+ * One Question round as the Correction log keeps it: its own id, the prompt that caused it, the
+ * questions and the Boss's answers, and the repo facts a Fixer record carries.
+ */
+type QuestionRoundRecord = {
+	id: string;
+	fixerRecordId?: string;
+	prompt: string;
+	questions: string[];
+	answers: string;
+	repoPath: string;
+	remote: string;
+	commit: string;
+};
+
 const INSTRUCTIONS = `You are the Fixer in pi-prompterize. Fix the spelling mistakes in the user's prompt.
 
 Rules:
@@ -199,6 +222,51 @@ function splitModel(model: string): { provider: string; id: string } {
 /** The text of an assistant message, from its text parts alone. */
 const textOf = (message: { content: { type: string; text?: string }[] }): string =>
 	message.content.flatMap((part) => (part.type === "text" && typeof part.text === "string" ? [part.text] : [])).join("");
+
+/** The agent's final reply in a run: the text of its last assistant message. */
+function finalReplyText(messages: readonly { role: string; content: unknown }[]): string {
+	const last = messages.filter((message) => message.role === "assistant").at(-1);
+	if (last === undefined || !Array.isArray(last.content)) return "";
+	return textOf({ content: last.content as { type: string; text?: string }[] });
+}
+
+/**
+ * A question in the grilling skill's format: the ❓ mark followed by a numbered, bold question.
+ * The number runs across a whole interview, so the marker carries whatever number it reached.
+ */
+const QUESTION_MARKER = /❓\s*\*\*Q\d+\*\*/;
+
+/**
+ * The questions of the Question round in an agent reply, each with its body and suggested answer,
+ * or null when the reply holds no Question round. The marker starts each question and a rule or
+ * the closing "For your information" section ends the last one, so no context outside the round
+ * lands in the record.
+ */
+function questionRoundIn(reply: string): string[] | null {
+	const questions: string[] = [];
+	let current: string[] | null = null;
+	const finish = (): void => {
+		if (current === null) return;
+		const question = current.join("\n").trim();
+		if (question.length > 0) questions.push(question);
+		current = null;
+	};
+	for (const line of reply.split("\n")) {
+		if (QUESTION_MARKER.test(line)) {
+			finish();
+			current = [line];
+			continue;
+		}
+		if (current === null) continue;
+		if (line.trim() === "---" || /^\s*\*\*For your information\*\*/i.test(line)) {
+			finish();
+			continue;
+		}
+		current.push(line);
+	}
+	finish();
+	return questions.length > 0 ? questions : null;
+}
 
 /** The Fixer's reply as JSON, with the code fence a model sometimes adds removed. */
 function parseReply(raw: string): FixerReply {
@@ -554,9 +622,18 @@ async function repoFacts(pi: ExtensionAPI, cwd: string): Promise<RepoFacts> {
 	return { repoPath, remote: url.code === 0 ? url.stdout.trim() : "", commit };
 }
 
+/** Append one record to the Correction log, making its folder the first time. */
+async function appendCorrectionRecord(record: FixerRecord | QuestionRoundRecord): Promise<void> {
+	const path = correctionLogPath();
+	await mkdir(dirname(path), { recursive: true });
+	await appendFile(path, `${JSON.stringify(record)}\n`, "utf8");
+}
+
 /**
- * Append one Fixer record to the Correction log. The log is a study aid, so a log that cannot
- * be made or written is dropped: whatever the log does, the Boss's prompt still goes on.
+ * Append one Fixer record to the Correction log and answer its id, so a Question round can link
+ * back to the run that caused it, or undefined when the log could not be written. The log is a
+ * study aid, so a log that cannot be made or written is dropped: whatever the log does, the
+ * Boss's prompt still goes on.
  */
 async function logFixerRun(
 	pi: ExtensionAPI,
@@ -564,7 +641,7 @@ async function logFixerRun(
 	settings: FixerSettings,
 	original: string,
 	run: FixerRun,
-): Promise<void> {
+): Promise<string | undefined> {
 	try {
 		const { repoPath, remote, commit } = await repoFacts(pi, ctx.cwd);
 		const record: FixerRecord = {
@@ -578,9 +655,38 @@ async function logFixerRun(
 			original,
 			...run,
 		};
-		const path = correctionLogPath();
-		await mkdir(dirname(path), { recursive: true });
-		await appendFile(path, `${JSON.stringify(record)}\n`, "utf8");
+		await appendCorrectionRecord(record);
+		return record.id;
+	} catch {
+		// A Correction log that cannot be written never stops or changes the prompt.
+		return undefined;
+	}
+}
+
+/**
+ * Append one Question round to the Correction log. Like a Fixer record, the log is a study aid: a
+ * log that cannot be written never stops or changes the Boss's next prompt.
+ */
+async function logQuestionRound(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	cause: QuestionRoundCause,
+	questions: string[],
+	answers: string,
+): Promise<void> {
+	try {
+		const { repoPath, remote, commit } = await repoFacts(pi, ctx.cwd);
+		const record: QuestionRoundRecord = {
+			id: randomUUID(),
+			...(cause.fixerRecordId === undefined ? {} : { fixerRecordId: cause.fixerRecordId }),
+			prompt: cause.prompt,
+			questions,
+			answers,
+			repoPath,
+			remote,
+			commit,
+		};
+		await appendCorrectionRecord(record);
 	} catch {
 		// A Correction log that cannot be written never stops or changes the prompt.
 	}
@@ -588,37 +694,64 @@ async function logFixerRun(
 
 export default function prompterize(pi: ExtensionAPI): void {
 	/**
-	 * The text of the next run's prompt when that run should carry the Clarity note, or null.
-	 * The input handler sets it; `before_agent_start` consumes it, and matches it against the
-	 * run's prompt so a run started by another extension or RPC can never pick it up.
+	 * The prompt and cause of the next run when that run should carry the Clarity note, or null.
+	 * The input handler sets it; `before_agent_start` consumes it, and matches the prompt against
+	 * the run's prompt so a run started by another extension or RPC can never pick it up.
 	 */
-	let promptForClarityNote: string | null = null;
+	let clarityNoteFor: { prompt: string; cause: QuestionRoundCause } | null = null;
+	/**
+	 * The cause of the run now under way when that run carried the Clarity note, or null. Its end
+	 * is the only place the agent's reply can be read for a Question round.
+	 */
+	let clarityRun: QuestionRoundCause | null = null;
+	/**
+	 * The Question round the last Clarity run asked, waiting for the Boss's next typed prompt to
+	 * answer it, or null. Only a typed prompt can answer a Question round, so a slash command or
+	 * a prompt from RPC or another extension leaves it waiting.
+	 */
+	let unansweredRound: { cause: QuestionRoundCause; questions: string[] } | null = null;
 
 	pi.on("before_agent_start", (event) => {
-		const prompt = promptForClarityNote;
-		promptForClarityNote = null;
+		const noteFor = clarityNoteFor;
+		clarityNoteFor = null;
 		if (event.messageType !== "user") return;
-		if (prompt === null || event.prompt !== prompt) return;
+		if (noteFor === null || event.prompt !== noteFor.prompt) return;
 		event.systemPromptOptions.sections.clarity_note = CLARITY_NOTE;
+		clarityRun = noteFor.cause;
+	});
+
+	pi.on("agent_end", (event) => {
+		const cause = clarityRun;
+		clarityRun = null;
+		if (cause === null) return;
+		const questions = questionRoundIn(finalReplyText(event.messages));
+		if (questions !== null) unansweredRound = { cause, questions };
 	});
 
 	pi.on("input", async (event, ctx) => {
-		promptForClarityNote = null;
+		clarityNoteFor = null;
 		// Only the Boss's own typing is a typed prompt (GLOSSARY.md).
 		if (event.source !== "interactive") return { action: "continue" };
 		// Slash commands are pi's, not the Fixer's, and carry no Clarity note.
 		if (event.text.startsWith("/")) return { action: "continue" };
 		// The Skip prefix sends the rest with neither the Fixer nor the Clarity note.
-		if (event.text.startsWith("*")) return { action: "transform", text: event.text.slice(1) };
+		const typed = event.text.startsWith("*") ? event.text.slice(1) : event.text;
+		// A typed prompt after a Question round is the Boss's answer to it.
+		if (unansweredRound !== null) {
+			await logQuestionRound(pi, ctx, unansweredRound.cause, unansweredRound.questions, typed);
+			unansweredRound = null;
+		}
+		if (event.text.startsWith("*")) return { action: "transform", text: typed };
 		const piSettings = pi.getSettings();
 		const settings = fixerSettings(piSettings);
 		let text = event.text;
+		let fixerRecordId: string | undefined;
 		if (settings.enabled) {
 			const run = await fixPrompt(pi, ctx, event.text, settings);
-			await logFixerRun(pi, ctx, settings, event.text, run);
+			fixerRecordId = await logFixerRun(pi, ctx, settings, event.text, run);
 			if (run.outcome === "fixed") text = run.fixed;
 		}
-		if (clarityEnabled(piSettings)) promptForClarityNote = text;
+		if (clarityEnabled(piSettings)) clarityNoteFor = { prompt: text, cause: { fixerRecordId, prompt: event.text } };
 		return text === event.text ? { action: "continue" } : { action: "transform", text };
 	});
 }
