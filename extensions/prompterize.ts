@@ -396,21 +396,27 @@ function restoreSpans(text: string, spans: ProtectedSpan[]): string {
 const FIXER_STATUS_KEY = "prompterize";
 const FIXER_STATUS_TEXT = "fixing prompt…";
 
-/**
- * The result of a call that Esc cancelled: the prompt goes on as typed, and the Correction log
- * records how long the Boss waited before pressing Esc.
- */
-function cancelledRun(time: string, started: number, prompt: string): FixerRun {
-	return { time, durationMs: Date.now() - started, outcome: "cancelled", fixed: prompt, changes: [] };
+/** The record a run ends with: when it started, how long the call took, and what came of it. */
+function runEnded(started: number, run: Omit<FixerRun, "time" | "durationMs">): FixerRun {
+	return { time: new Date(started).toISOString(), durationMs: Date.now() - started, ...run };
 }
 
 /**
- * Wait for `reply` unless `signal` aborts first. The stream is left to the provider's own abort
- * handling, so a provider that ignores the signal cannot hold the Boss's prompt.
+ * The record a call that Esc cancelled ends with: the prompt goes on as typed, and the Correction
+ * log records how long the Boss waited before pressing Esc.
  */
-function abortable<T>(reply: Promise<T>, signal: AbortSignal): Promise<T> {
+function cancelledRun(started: number, prompt: string): FixerRun {
+	return runEnded(started, { outcome: "cancelled", fixed: prompt, changes: [] });
+}
+
+/**
+ * Wait for `reply` unless `signal` aborts first, which answers `undefined`. The stream keeps its
+ * own abort handling; this only decides when the Fixer stops waiting, so a provider that ignores
+ * the signal cannot hold the Boss's prompt.
+ */
+function unlessAborted<T>(reply: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
 	return new Promise((resolve, reject) => {
-		const abort = () => reject(new Error("the Fixer's call was cancelled"));
+		const abort = () => resolve(undefined);
 		if (signal.aborted) {
 			reply.catch(() => {});
 			abort();
@@ -431,13 +437,13 @@ function abortable<T>(reply: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 /**
- * Send one prompt to the Fixer's model and return what the run did to it. Esc during the wait
- * aborts the call and leaves the prompt as typed. The result is total: a failure comes back as
- * the error outcome, so the caller never has to catch one.
+ * Send one prompt to the Fixer's model and return what the run did to it, showing pi's status
+ * line while it waits. Esc during the wait aborts the call and leaves the prompt as typed. The
+ * result is total: a failure comes back as the error outcome, so the caller never has to catch
+ * one.
  */
 async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerSettings): Promise<FixerRun> {
 	const started = Date.now();
-	const time = new Date(started).toISOString();
 	const controller = new AbortController();
 	// Esc during the wait cancels the call, so the Boss is never stuck behind a slow or hung model.
 	const stopListening = ctx.ui.onTerminalInput((data) => {
@@ -445,6 +451,7 @@ async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerS
 		controller.abort();
 		return { consume: true };
 	});
+	ctx.ui.setStatus(FIXER_STATUS_KEY, FIXER_STATUS_TEXT);
 	try {
 		const { provider, id } = splitModel(settings.model);
 		const model: Model<Api> | undefined = ctx.modelRegistry.find(provider, id);
@@ -454,38 +461,37 @@ async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerS
 			systemPrompt: INSTRUCTIONS,
 			messages: [{ role: "user", content: [{ type: "text", text: protectedPrompt.text }], timestamp: started }],
 		};
-		const reply = await abortable(
+		const reply = await unlessAborted(
 			ctx.modelRegistry
 				.streamSimple(model, context, { reasoning: settings.thinkingLevel, signal: controller.signal })
 				.result(),
 			controller.signal,
 		);
-		if (controller.signal.aborted || reply.stopReason === "aborted") return cancelledRun(time, started, prompt);
+		if (reply === undefined || reply.stopReason === "aborted") return cancelledRun(started, prompt);
 		if (reply.stopReason !== "stop") throw new Error(reply.errorMessage ?? `the Fixer stopped with ${reply.stopReason}`);
 		const parsed = parseReply(textOf(reply));
 		checkPlaceholders(parsed.text, protectedPrompt.spans);
 		const fixed = restoreSpans(parsed.text, protectedPrompt.spans);
-		return {
-			time,
-			durationMs: Date.now() - started,
+		return runEnded(started, {
 			outcome: fixed === prompt ? "unchanged" : "fixed",
 			fixed,
 			changes: parsed.changes.map((change) => ({
 				from: restoreSpans(change.from, protectedPrompt.spans),
 				to: restoreSpans(change.to, protectedPrompt.spans),
 			})),
-		};
+		});
 	} catch (failure) {
-		if (controller.signal.aborted) return cancelledRun(time, started, prompt);
-		return {
-			time,
-			durationMs: Date.now() - started,
+		// A provider that fails on the abort, rather than reporting it, still ends as cancelled.
+		if (controller.signal.aborted) return cancelledRun(started, prompt);
+		return runEnded(started, {
 			outcome: "error",
 			fixed: prompt,
 			changes: [],
 			error: failure instanceof Error ? failure.message : String(failure),
-		};
+		});
 	} finally {
+		// However the call ended, pi stops saying it is fixing the prompt.
+		ctx.ui.setStatus(FIXER_STATUS_KEY, undefined);
 		stopListening();
 	}
 }
@@ -575,10 +581,7 @@ export default function prompterize(pi: ExtensionAPI): void {
 		const settings = fixerSettings(piSettings);
 		let text = event.text;
 		if (settings.enabled) {
-			ctx.ui.setStatus(FIXER_STATUS_KEY, FIXER_STATUS_TEXT);
-			const run = await fixPrompt(ctx, event.text, settings).finally(() =>
-				ctx.ui.setStatus(FIXER_STATUS_KEY, undefined),
-			);
+			const run = await fixPrompt(ctx, event.text, settings);
 			await logFixerRun(pi, ctx, settings, event.text, run);
 			if (run.outcome === "fixed") text = run.fixed;
 		}

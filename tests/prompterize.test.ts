@@ -83,8 +83,12 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 	const dir = mkdtempSync(join(tmpdir(), "pi-prompterize-"));
 	const home = join(dir, "home");
 	const agentDir = join(dir, "pi-agent");
+	const log = join(dir, "requests.jsonl");
 	mkdirSync(home, { recursive: true });
 	mkdirSync(agentDir, { recursive: true });
+	// The log exists, empty, from the start: a test reads it before any request is written, so a
+	// missing file stays a fault instead of answering the same as no request.
+	writeFileSync(log, "");
 	if (options.settings !== undefined) writeFileSync(join(agentDir, "settings.json"), JSON.stringify(options.settings));
 	writeFileSync(join(dir, "README.md"), "# a temporary repo\n");
 	git(dir, ["init", "--quiet", "--initial-branch=main"]);
@@ -106,7 +110,7 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 		remote: remote ?? "",
 		commit: git(dir, ["rev-parse", "HEAD"]),
 	};
-	const workspace = { dir, home, agentDir, data: join(dir, "data"), log: join(dir, "requests.jsonl"), repo };
+	const workspace = { dir, home, agentDir, data: join(dir, "data"), log, repo };
 	workspaces.push(workspace);
 	return workspace;
 }
@@ -203,9 +207,8 @@ async function runRpc(
 	});
 }
 
-/** Every request the test provider wrote, in order. A workspace whose log is not written yet has none. */
+/** Every request the test provider wrote, in order. */
 function requests(workspace: Workspace): Request[] {
-	if (!existsSync(workspace.log)) return [];
 	return readFileSync(workspace.log, "utf8")
 		.split("\n")
 		.filter(Boolean)
@@ -741,8 +744,8 @@ const MAIN_MODEL = {
 	maxTokens: 4096,
 };
 
-/** One status the TUI was asked to show, and how many Fixer requests had been recorded when it changed. */
-type StatusChange = { key: string; text: string | undefined; fixerRequests: number };
+/** One status the TUI was asked to show. */
+type StatusChange = { key: string; text: string | undefined };
 
 /** pi's UI port as a test sees it: the statuses the footer would show, and the keys the editor receives. */
 type TestTui = {
@@ -753,7 +756,7 @@ type TestTui = {
 };
 
 /** The TUI stand-in: it records status changes and lets a test press a key. */
-function makeTestTui(workspace: Workspace): TestTui {
+function makeTestTui(): TestTui {
 	const statuses: StatusChange[] = [];
 	const inputHandlers = new Set<(data: string) => { consume?: boolean } | undefined>();
 	const ui: Record<string, unknown> = {
@@ -766,7 +769,7 @@ function makeTestTui(workspace: Workspace): TestTui {
 			return () => inputHandlers.delete(handler);
 		},
 		setStatus(key: string, text: string | undefined) {
-			statuses.push({ key, text, fixerRequests: reached(workspace, "opencode-go").length });
+			statuses.push({ key, text });
 		},
 		setWorkingMessage: () => {},
 		setWorkingVisible: () => {},
@@ -830,7 +833,7 @@ async function runInteractiveSession(
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = value;
 	}
-	const tui = makeTestTui(workspace);
+	const tui = makeTestTui();
 	let session: SdkSession | undefined;
 	try {
 		const sdk = await loadPiSdk();
@@ -880,18 +883,19 @@ test("pi shows the fixing prompt… status while the Fixer's model call runs and
 			PROMPTERIZE_TEST_FIX_DELAY_MS: "150",
 		},
 		duringFixer: (running) => {
+			assert.equal(reached(workspace, "opencode-go").length, 1, "the Fixer's model was asked while the status showed");
 			assert.deepEqual(
-				running.statuses.at(-1),
-				{ key: "prompterize", text: "fixing prompt…", fixerRequests: 0 },
-				"the status was shown before the Fixer's model request",
+				running.statuses,
+				[{ key: "prompterize", text: "fixing prompt…" }],
+				"the status showed before the model's reply and had not yet been cleared",
 			);
 		},
 	});
 	assert.deepEqual(
 		tui.statuses,
 		[
-			{ key: "prompterize", text: "fixing prompt…", fixerRequests: 0 },
-			{ key: "prompterize", text: undefined, fixerRequests: 1 },
+			{ key: "prompterize", text: "fixing prompt…" },
+			{ key: "prompterize", text: undefined },
 		],
 		"the status was cleared once the call ended",
 	);
