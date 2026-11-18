@@ -17,6 +17,10 @@
  * rejected by a plain string comparison, and the prompt goes on as typed with the run logged as
  * an error.
  *
+ * While the Fixer's model runs, pi's status line shows "fixing prompt…", and Esc aborts the call.
+ * The prompt then goes on as typed and the Correction log records the run as cancelled with the
+ * time waited. The status is cleared however the call ends.
+ *
  * The seam is the real pi session (see tests/prompterize.test.ts): this file wires pi's
  * `input` and `before_agent_start` events to the Fixer and the Clarity note, and the Fixer
  * speaks to its model through `ctx.modelRegistry.streamSimple()`, so pi's own credentials
@@ -388,13 +392,66 @@ function restoreSpans(text: string, spans: ProtectedSpan[]): string {
 	return spans.reduce((restored, { placeholder, span }) => restored.split(placeholder).join(span), text);
 }
 
+/** The status line pi shows while the Fixer waits on its model. */
+const FIXER_STATUS_KEY = "prompterize";
+const FIXER_STATUS_TEXT = "fixing prompt…";
+
+/** The record a run ends with: when it started, how long the call took, and what came of it. */
+function runEnded(started: number, run: Omit<FixerRun, "time" | "durationMs">): FixerRun {
+	return { time: new Date(started).toISOString(), durationMs: Date.now() - started, ...run };
+}
+
 /**
- * Send one prompt to the Fixer's model and return what the run did to it. The result is total:
- * a failure comes back as the error outcome, so the caller never has to catch one.
+ * The record a call that Esc cancelled ends with: the prompt goes on as typed, and the Correction
+ * log records how long the Boss waited before pressing Esc.
+ */
+function cancelledRun(started: number, prompt: string): FixerRun {
+	return runEnded(started, { outcome: "cancelled", fixed: prompt, changes: [] });
+}
+
+/**
+ * Wait for `reply` unless `signal` aborts first, which answers `undefined`. The stream keeps its
+ * own abort handling; this only decides when the Fixer stops waiting, so a provider that ignores
+ * the signal cannot hold the Boss's prompt.
+ */
+function unlessAborted<T>(reply: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+	return new Promise((resolve, reject) => {
+		const abort = () => resolve(undefined);
+		if (signal.aborted) {
+			reply.catch(() => {});
+			abort();
+			return;
+		}
+		signal.addEventListener("abort", abort, { once: true });
+		reply.then(
+			(value) => {
+				signal.removeEventListener("abort", abort);
+				resolve(value);
+			},
+			(failure) => {
+				signal.removeEventListener("abort", abort);
+				reject(failure);
+			},
+		);
+	});
+}
+
+/**
+ * Send one prompt to the Fixer's model and return what the run did to it, showing pi's status
+ * line while it waits. Esc during the wait aborts the call and leaves the prompt as typed. The
+ * result is total: a failure comes back as the error outcome, so the caller never has to catch
+ * one.
  */
 async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerSettings): Promise<FixerRun> {
 	const started = Date.now();
-	const time = new Date(started).toISOString();
+	const controller = new AbortController();
+	// Esc during the wait cancels the call, so the Boss is never stuck behind a slow or hung model.
+	const stopListening = ctx.ui.onTerminalInput((data) => {
+		if (data !== "\x1b") return undefined;
+		controller.abort();
+		return { consume: true };
+	});
+	ctx.ui.setStatus(FIXER_STATUS_KEY, FIXER_STATUS_TEXT);
 	try {
 		const { provider, id } = splitModel(settings.model);
 		const model: Model<Api> | undefined = ctx.modelRegistry.find(provider, id);
@@ -404,30 +461,38 @@ async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerS
 			systemPrompt: INSTRUCTIONS,
 			messages: [{ role: "user", content: [{ type: "text", text: protectedPrompt.text }], timestamp: started }],
 		};
-		const reply = await ctx.modelRegistry.streamSimple(model, context, { reasoning: settings.thinkingLevel }).result();
+		const reply = await unlessAborted(
+			ctx.modelRegistry
+				.streamSimple(model, context, { reasoning: settings.thinkingLevel, signal: controller.signal })
+				.result(),
+			controller.signal,
+		);
+		if (reply === undefined || reply.stopReason === "aborted") return cancelledRun(started, prompt);
 		if (reply.stopReason !== "stop") throw new Error(reply.errorMessage ?? `the Fixer stopped with ${reply.stopReason}`);
 		const parsed = parseReply(textOf(reply));
 		checkPlaceholders(parsed.text, protectedPrompt.spans);
 		const fixed = restoreSpans(parsed.text, protectedPrompt.spans);
-		return {
-			time,
-			durationMs: Date.now() - started,
+		return runEnded(started, {
 			outcome: fixed === prompt ? "unchanged" : "fixed",
 			fixed,
 			changes: parsed.changes.map((change) => ({
 				from: restoreSpans(change.from, protectedPrompt.spans),
 				to: restoreSpans(change.to, protectedPrompt.spans),
 			})),
-		};
+		});
 	} catch (failure) {
-		return {
-			time,
-			durationMs: Date.now() - started,
+		// A provider that fails on the abort, rather than reporting it, still ends as cancelled.
+		if (controller.signal.aborted) return cancelledRun(started, prompt);
+		return runEnded(started, {
 			outcome: "error",
 			fixed: prompt,
 			changes: [],
 			error: failure instanceof Error ? failure.message : String(failure),
-		};
+		});
+	} finally {
+		// However the call ended, pi stops saying it is fixing the prompt.
+		ctx.ui.setStatus(FIXER_STATUS_KEY, undefined);
+		stopListening();
 	}
 }
 
