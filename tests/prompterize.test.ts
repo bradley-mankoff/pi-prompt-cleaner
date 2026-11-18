@@ -249,16 +249,39 @@ type FixerRecord = {
 	error?: string;
 };
 
+/** One Question round, as the Bead names its fields. */
+type QuestionRoundRecord = {
+	id: string;
+	fixerRecordId?: string;
+	prompt: string;
+	questions: string[];
+	answers: string;
+	repoPath: string;
+	remote: string;
+	commit: string;
+};
+
+/** A line of the Correction log: a Fixer record or a Question round record. */
+type CorrectionRecord = FixerRecord | QuestionRoundRecord;
+
 /** Where a test's Correction log lives: under the data folder piEnv hands pi as XDG_DATA_HOME. */
 const correctionLog = (workspace: Workspace): string => join(workspace.data, "pi-prompterize", "corrections.jsonl");
 
 /** Every record in the Correction log at `path`, in the order it was written. */
-function correctionRecords(path: string): FixerRecord[] {
+function correctionRecords(path: string): CorrectionRecord[] {
 	return readFileSync(path, "utf8")
 		.split("\n")
 		.filter(Boolean)
-		.map((line) => JSON.parse(line) as FixerRecord);
+		.map((line) => JSON.parse(line) as CorrectionRecord);
 }
+
+/** The Fixer records in the Correction log at `path`, in the order they were written. */
+const fixerRecords = (path: string): FixerRecord[] =>
+	correctionRecords(path).filter((record): record is FixerRecord => "outcome" in record);
+
+/** The Question round records in the Correction log at `path`, in the order they were written. */
+const questionRoundRecords = (path: string): QuestionRoundRecord[] =>
+	correctionRecords(path).filter((record): record is QuestionRoundRecord => "questions" in record);
 
 test("a typed prompt with typos reaches the main model as the Fixer's fixed text, with no note of what changed", () => {
 	const workspace = makeWorkspace();
@@ -508,7 +531,7 @@ test("a fixed prompt appends one Fixer record to the Correction log under XDG_DA
 	});
 	const after = Date.now();
 	assert.equal(run.status, 0, run.stderr);
-	const records = correctionRecords(correctionLog(workspace));
+	const records = fixerRecords(correctionLog(workspace));
 	assert.equal(records.length, 1, "the run wrote one line, one Fixer record");
 	const record = records[0];
 	assert.equal(record.outcome, "fixed");
@@ -541,7 +564,7 @@ test("a prompt the Fixer left as it was is logged with outcome unchanged", () =>
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: typed, changes: [] }),
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = correctionRecords(correctionLog(workspace));
+	const records = fixerRecords(correctionLog(workspace));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].outcome, "unchanged");
 	assert.equal(records[0].fixed, typed, "the text the main model received is the text as typed");
@@ -557,7 +580,7 @@ test("each Fixer run appends its own line, so the log keeps every run in order",
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the reader.", changes: [] }),
 	});
 	assert.equal(second.status, 0, second.stderr);
-	const records = correctionRecords(correctionLog(workspace));
+	const records = fixerRecords(correctionLog(workspace));
 	const originals = records.map((record) => record.original);
 	assert.deepEqual(originals, ["pleas fix teh parser", "pleas fix teh reader"]);
 });
@@ -568,7 +591,7 @@ test("a failed Fixer call is logged with outcome error and the error's message",
 		PROMPTERIZE_TEST_FIX_FAILURE: "the Fixer's model is down",
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = correctionRecords(correctionLog(workspace));
+	const records = fixerRecords(correctionLog(workspace));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].outcome, "error");
 	assert.equal(records[0].error, "the Fixer's model is down");
@@ -581,7 +604,7 @@ test("the Correction log falls back to ~/.local/share when XDG_DATA_HOME is unse
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = correctionRecords(join(workspace.home, ".local", "share", "pi-prompterize", "corrections.jsonl"));
+	const records = fixerRecords(join(workspace.home, ".local", "share", "pi-prompterize", "corrections.jsonl"));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].outcome, "fixed");
 });
@@ -606,7 +629,7 @@ test("a repo with no git remote logs the remote as empty and lets the fixed prom
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [] }),
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = correctionRecords(correctionLog(workspace));
+	const records = fixerRecords(correctionLog(workspace));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].remote, "");
 	assert.equal(records[0].commit, workspace.repo.commit, "the commit is still recorded");
@@ -680,7 +703,7 @@ for (const { mutation, verb } of placeholderMishandlings) {
 		const main = reached(workspace, "prompterize-test");
 		assert.equal(main.length, 1, "the prompt reached the main model once");
 		assert.equal(main[0].messages.at(-1), typedWithProtectedSpans, "the main model received the prompt exactly as typed");
-		const records = correctionRecords(correctionLog(workspace));
+		const records = fixerRecords(correctionLog(workspace));
 		assert.equal(records.length, 1, "the rejected run was logged");
 		assert.equal(records[0].outcome, "error", "a rejected reply is an error outcome");
 		assert.match(records[0].error ?? "", /placeholder/i, "the record says a placeholder was mishandled");
@@ -802,7 +825,7 @@ test("each change and each possibly hint, with its matches, appears in the Fixer
 		}),
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = correctionRecords(correctionLog(workspace));
+	const records = fixerRecords(correctionLog(workspace));
 	assert.equal(records.length, 1, "the run wrote one Fixer record");
 	assert.equal(records[0].outcome, "fixed");
 	assert.deepEqual(records[0].changes, changes, "the record holds the typo fix and the possibly hint with its matches");
@@ -966,15 +989,17 @@ type InteractiveOptions = {
 };
 
 /**
- * Run one typed prompt through a real pi session in-process, with the TUI stand-in at the UI edge.
- * The environment is swapped for the session's duration and restored afterwards, so each test
- * starts clean even though the process is shared.
+ * Run one or more typed prompts through a real pi session in-process, with the TUI stand-in at
+ * the UI edge. The environment is swapped for the session's duration and restored afterwards, so
+ * each test starts clean even though the process is shared. A second prompt is the Boss's reply
+ * to the first run, which is what lets a test answer a Question round.
  */
 async function runInteractiveSession(
 	workspace: Workspace,
-	typed: string,
+	prompts: string | readonly string[],
 	options: InteractiveOptions = {},
 ): Promise<TestTui> {
+	const typedPrompts = typeof prompts === "string" ? [prompts] : prompts;
 	const savedEnvironment = { ...process.env };
 	for (const [key, value] of Object.entries(piEnv(workspace, options.env ?? {}))) {
 		if (value === undefined) delete process.env[key];
@@ -1006,12 +1031,14 @@ async function runInteractiveSession(
 			})
 		).session;
 		await session.bindExtensions({ uiContext: tui.ui, mode: "tui" });
-		const prompt = session.prompt(typed);
-		if (options.duringFixer !== undefined) {
-			await waitFor(() => reached(workspace, "opencode-go").length === 1, "the Fixer's model request");
-			await options.duringFixer(tui);
+		for (const [index, typed] of typedPrompts.entries()) {
+			const prompt = session.prompt(typed);
+			if (options.duringFixer !== undefined && index === 0) {
+				await waitFor(() => reached(workspace, "opencode-go").length === 1, "the Fixer's model request");
+				await options.duringFixer(tui);
+			}
+			await prompt;
 		}
-		await prompt;
 	} finally {
 		session?.dispose();
 		for (const key of Object.keys(process.env)) {
@@ -1093,7 +1120,7 @@ test("Esc during the Fixer's model call sends the original prompt to the main mo
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1, "the prompt reached the main model once");
 	assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt exactly as typed");
-	const records = correctionRecords(correctionLog(workspace));
+	const records = fixerRecords(correctionLog(workspace));
 	assert.equal(records.length, 1, "the cancelled run wrote one Fixer record");
 	assert.equal(records[0].outcome, "cancelled");
 	assert.equal(records[0].original, typed);
@@ -1114,8 +1141,110 @@ test("a Fixer call longer than three seconds is still waited for, and its fix re
 	});
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the main model received the fix from the slow call");
-	const records = correctionRecords(correctionLog(workspace));
+	const records = fixerRecords(correctionLog(workspace));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].outcome, "fixed");
 	assert.ok(records[0].durationMs >= 3000, `the slow call was waited for: ${records[0].durationMs}ms`);
+});
+
+/**
+ * The Question round tests: the main model's reply holds a round in the grilling skill's format,
+ * the Boss answers with his next typed prompt, and the Correction log records the round. The
+ * tests read the log through the same seam as every test above.
+ */
+
+/** A main-model reply holding one Question round, formatted as the grilling skill formats one. */
+const questionRoundReply = [
+	"**Round 1**",
+	"",
+	"❓ **Q1** - **Which parser?**",
+	"",
+	"The repo has two parsers, and I cannot tell which one you meant.",
+	"",
+	"Should I change the JSON parser?",
+	"",
+	"➡️ Yes, change the JSON parser.",
+	"",
+	"---",
+	"",
+	"❓ **Q2** - **Which call site?**",
+	"",
+	"I found two callers of the parser.",
+	"",
+	"Should I change both callers?",
+	"",
+	"➡️ Yes, change both callers.",
+	"",
+	"---",
+	"",
+	"**For your information**: I read `src/parser.ts`.",
+].join("\n");
+
+/** The round's two questions as the Correction log should hold them, each with its suggestion. */
+const questionRoundQuestions = [
+	[
+		"❓ **Q1** - **Which parser?**",
+		"",
+		"The repo has two parsers, and I cannot tell which one you meant.",
+		"",
+		"Should I change the JSON parser?",
+		"",
+		"➡️ Yes, change the JSON parser.",
+	].join("\n"),
+	[
+		"❓ **Q2** - **Which call site?**",
+		"",
+		"I found two callers of the parser.",
+		"",
+		"Should I change both callers?",
+		"",
+		"➡️ Yes, change both callers.",
+	].join("\n"),
+];
+
+test("a Question round in the agent's reply followed by the Boss's next typed prompt appends one Question round record, linked to the Fixer record that caused it", async () => {
+	const workspace = makeWorkspace();
+	const typed = "fix the parser";
+	const answers = "yes";
+	await runInteractiveSession(workspace, [typed, answers], {
+		env: { PROMPTERIZE_TEST_REPLY: questionRoundReply },
+	});
+	const rounds = questionRoundRecords(correctionLog(workspace));
+	assert.equal(rounds.length, 1, "the Question round and its answers wrote one record");
+	const round = rounds[0];
+	assert.match(
+		round.id,
+		/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		"the record has an id of its own",
+	);
+	assert.deepEqual(round.questions, questionRoundQuestions, "the record holds the questions as the agent asked them");
+	assert.equal(round.answers, answers, "the record holds the Boss's next typed prompt as the answers");
+	assert.equal(round.prompt, typed, "the record holds the prompt that caused the round");
+	const fixer = fixerRecords(correctionLog(workspace));
+	assert.equal(round.fixerRecordId, fixer[0]?.id, "the record links to the Fixer record for the prompt that caused it");
+	assert.equal(round.repoPath, workspace.repo.path);
+	assert.equal(round.remote, workspace.repo.remote);
+	assert.equal(round.commit, workspace.repo.commit);
+});
+
+test("with the Fixer off, a Question round record holds the causing prompt itself instead of a Fixer record id", async () => {
+	const settings = { prompterize: { fixer: { enabled: false } } };
+	const workspace = makeWorkspace({ settings });
+	const typed = "fix the parser";
+	await runInteractiveSession(workspace, [typed, "yes"], {
+		env: { PROMPTERIZE_TEST_REPLY: questionRoundReply },
+	});
+	const rounds = questionRoundRecords(correctionLog(workspace));
+	assert.equal(rounds.length, 1, "the Question round and its answers wrote one record");
+	assert.equal(rounds[0].prompt, typed, "the record holds the prompt that caused the round");
+	assert.equal(rounds[0].fixerRecordId, undefined, "with the Fixer off there is no Fixer record to link to");
+});
+
+test("an agent reply with no Question round adds no Question round record", async () => {
+	const workspace = makeWorkspace();
+	await runInteractiveSession(workspace, ["fix the parser", "thanks"], {
+		env: { PROMPTERIZE_TEST_REPLY: "The parser is fixed." },
+	});
+	assert.equal(fixerRecords(correctionLog(workspace)).length, 2, "both typed prompts went through the Fixer and were logged");
+	assert.equal(questionRoundRecords(correctionLog(workspace)).length, 0, "no reply held a Question round, so no Question round record was written");
 });
