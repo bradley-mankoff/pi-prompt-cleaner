@@ -121,8 +121,8 @@ smarter model can study it. One line holds one run:
   "thinkingLevel": "low",
   "durationMs": 812,
   "outcome": "fixed",
-  "original": "pleas fix teh parser",
-  "fixed": "Please fix the parser.",
+  "original": "pleas fix teh authsesion check",
+  "fixed": "Please fix the authsesion (possibly src/auth-session.ts or src/auth-sessions.ts) check",
   "changes": [
     { "from": "pleas", "to": "Please" },
     { "from": "teh", "to": "the" },

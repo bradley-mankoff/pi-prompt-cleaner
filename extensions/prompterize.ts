@@ -99,11 +99,17 @@ const CLARITY_NOTE = `Clarity note: before acting, judge whether this prompt is 
 
 Do not add or call a tool for this; ask the questions in your reply.`;
 
+/** A typo the Fixer fixed: the text as typed, and the text after fixing. */
+type TypoFix = { from: string; to: string };
+
+/** A possibly hint the Fixer added: the word as typed, and the real names close to it. */
+type PossiblyHint = { word: string; possibly: string[] };
+
 /**
  * One entry in the Fixer's changes list: a typo it fixed, or a word it left as typed with a
  * possibly hint naming the real names close to it.
  */
-type FixerChange = { from: string; to: string } | { word: string; possibly: string[] };
+type FixerChange = TypoFix | PossiblyHint;
 
 /** What the Fixer's model replies with: the prompt after fixing, and each change it made. */
 type FixerReply = { text: string; changes: FixerChange[] };
@@ -415,6 +421,12 @@ function restoreSpans(text: string, spans: ProtectedSpan[]): string {
 	return spans.reduce((restored, { placeholder, span }) => restored.split(placeholder).join(span), text);
 }
 
+/** Put each protected span back in a change's text, whichever kind of change it is. */
+function restoreChange(change: FixerChange, spans: ProtectedSpan[]): FixerChange {
+	if ("from" in change) return { from: restoreSpans(change.from, spans), to: restoreSpans(change.to, spans) };
+	return { word: restoreSpans(change.word, spans), possibly: change.possibly.map((name) => restoreSpans(name, spans)) };
+}
+
 /** The status line pi shows while the Fixer waits on its model. */
 const FIXER_STATUS_KEY = "prompterize";
 const FIXER_STATUS_TEXT = "fixing prompt…";
@@ -499,17 +511,7 @@ async function fixPrompt(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string
 		return runEnded(started, {
 			outcome: fixed === prompt ? "unchanged" : "fixed",
 			fixed,
-			changes: parsed.changes.map((change) =>
-				"from" in change
-					? {
-							from: restoreSpans(change.from, protectedPrompt.spans),
-							to: restoreSpans(change.to, protectedPrompt.spans),
-						}
-					: {
-							word: restoreSpans(change.word, protectedPrompt.spans),
-							possibly: change.possibly.map((name) => restoreSpans(name, protectedPrompt.spans)),
-						},
-			),
+			changes: parsed.changes.map((change) => restoreChange(change, protectedPrompt.spans)),
 		});
 	} catch (failure) {
 		// A provider that fails on the abort, rather than reporting it, still ends as cancelled.

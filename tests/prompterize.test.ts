@@ -94,15 +94,16 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 	writeFileSync(log, "");
 	if (options.settings !== undefined) writeFileSync(join(agentDir, "settings.json"), JSON.stringify(options.settings));
 	writeFileSync(join(dir, "README.md"), "# a temporary repo\n");
-	const tracked = ["README.md", ...(options.files ?? [])];
-	for (const file of tracked.slice(1)) {
+	// Each file a test names is a tracked real name, so the Fixer may offer it to its model.
+	const files = options.files ?? [];
+	for (const file of files) {
 		mkdirSync(dirname(join(dir, file)), { recursive: true });
 		writeFileSync(join(dir, file), "// a real file in the temporary repo\n");
 	}
 	git(dir, ["init", "--quiet", "--initial-branch=main"]);
 	const remote = options.remote === undefined ? TEST_REMOTE : options.remote;
 	if (remote !== null) git(dir, ["remote", "add", "origin", remote]);
-	git(dir, ["add", ...tracked]);
+	git(dir, ["add", "README.md", ...files]);
 	git(dir, [
 		"-c",
 		"user.name=prompterize test",

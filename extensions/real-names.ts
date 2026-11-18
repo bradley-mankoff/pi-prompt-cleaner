@@ -16,6 +16,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 /** One word from the prompt that looks like a path or symbol, with the real names close to it. */
 export type RealNameMatch = { word: string; names: string[] };
 
+/** One real name, with the forms of it that a typed word is matched against. */
+type RealNameKeys = { name: string; keys: string[] };
+
 /** How many close real names one word may carry to the Fixer's model. */
 const MAX_NAMES = 5;
 
@@ -30,13 +33,13 @@ const MIN_WORD_LENGTH = 4;
 export async function closeRealNames(pi: ExtensionAPI, cwd: string, text: string): Promise<RealNameMatch[]> {
 	const names = await trackedFileNames(pi, cwd);
 	if (names.length === 0) return [];
-	const keys = names.map((name) => ({ name, keys: matchKeys(name) }));
+	const realNames: RealNameKeys[] = names.map((name) => ({ name, keys: matchKeys(name) }));
 	const matches: RealNameMatch[] = [];
 	const seen = new Set<string>();
 	for (const word of suspectWords(text)) {
 		if (seen.has(word)) continue;
 		seen.add(word);
-		const close = closeNamesFor(normalise(word), keys);
+		const close = closeNamesFor(normalise(word), realNames);
 		if (close.length > 0) matches.push({ word, names: close });
 	}
 	return matches;
@@ -86,14 +89,22 @@ function matchKeys(name: string): string[] {
 	return [...new Set([name, base, stem].map(normalise).filter((key) => key.length > 0))];
 }
 
+/**
+ * How many letters one normalised word may have wrong, missing or extra: one for every four
+ * characters of it, and always at least one, so a short word may still misspell a real name.
+ */
+function toleranceFor(query: string): number {
+	return Math.max(1, Math.floor(query.length / 4));
+}
+
 /** The real names close to one normalised word, nearest first and at most `MAX_NAMES` of them. */
-function closeNamesFor(query: string, keys: { name: string; keys: string[] }[]): string[] {
-	const limit = Math.max(1, Math.floor(query.length / 4));
+function closeNamesFor(query: string, realNames: RealNameKeys[]): string[] {
+	const tolerance = toleranceFor(query);
 	const close: { name: string; distance: number }[] = [];
-	for (const { name, keys: forms } of keys) {
-		let distance = limit + 1;
-		for (const form of forms) distance = Math.min(distance, editDistance(query, form, limit));
-		if (distance <= limit) close.push({ name, distance });
+	for (const { name, keys } of realNames) {
+		let distance = tolerance + 1;
+		for (const key of keys) distance = Math.min(distance, editDistance(query, key, tolerance));
+		if (distance <= tolerance) close.push({ name, distance });
 	}
 	return close
 		.sort((left, right) => left.distance - right.distance || left.name.localeCompare(right.name))
