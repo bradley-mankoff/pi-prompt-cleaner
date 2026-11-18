@@ -1,12 +1,11 @@
 # pi-prompterize
 
-Prepares each prompt you type into pi before the main agent reads it. Today that means the
-Fixer: a cheap, fast model that silently fixes the typos in a typed prompt, so you can type
-fast without correcting every word yourself. The main agent receives the fixed text, with no
-note of what changed.
+Prepares each prompt you type into pi before the main agent reads it. The Fixer silently
+fixes the typos in a typed prompt, and the Clarity note lets the main agent ask when a prompt
+is unclear. The main agent receives the fixed text, with no note of what changed.
 
-Later versions add real-name lookup for symbols and file paths, and a Clarity note that lets
-the main agent ask when a prompt is unclear. See the project's Beads for that work.
+Later versions add real-name lookup for symbols and file paths. See the project's Beads for
+that work.
 
 ## Install
 
@@ -34,14 +33,31 @@ goes on unchanged, so a broken Fixer never blocks your work.
 
 ### Skip prefix
 
-Start a typed prompt with `*` to send it without the Fixer (and, later, without the Clarity
-note). The `*` is stripped before the prompt goes on:
+Start a typed prompt with `*` to send it without the Fixer and without the Clarity note. The
+`*` is stripped before the prompt goes on:
 
 ```text
 *please leave this exactly as i typed it
 ```
 
 The main agent receives `please leave this exactly as i typed it`.
+
+## The Clarity note
+
+A typed prompt that was not skipped also carries the **Clarity note** to the main agent. It
+is added to the run's system prompt and asks the agent to judge the prompt before acting:
+
+- If the prompt is clear, or the context makes the intent plain, the agent proceeds at once,
+  so the note costs nothing on a clear prompt.
+- If it is not clear, the agent first looks up what it can find for itself, then asks one
+  **Question round** in the grilling skill's format: numbered questions, each with a suggested
+  answer, where "yes" accepts all of them. It waits for the answer before working.
+- If the prompt starts a whole new feature or project, the agent runs the grilling skill in
+  full instead of asking one Question round.
+
+The note adds no tool; the agent asks in its reply. Its text is adapted from severity1's
+claude-code-prompt-improver (MIT, Copyright (c) 2025 severity1), whose notice sits beside the
+text in `extensions/prompterize.ts`.
 
 ## Correction log
 
@@ -89,6 +105,9 @@ Settings live under a `prompterize` key in pi's `settings.json`, either the glob
       "enabled": true,
       "model": "opencode-go/deepseek-v4.1-flash",
       "thinkingLevel": "low"
+    },
+    "clarity": {
+      "enabled": true
     }
   }
 }
@@ -99,6 +118,7 @@ Settings live under a `prompterize` key in pi's `settings.json`, either the glob
 | `prompterize.fixer.enabled` | `true` | Whether typed prompts go to the Fixer. `false` sends them unchanged. |
 | `prompterize.fixer.model` | `"opencode-go/deepseek-v4.1-flash"` | The Fixer's model, as `provider/id`. |
 | `prompterize.fixer.thinkingLevel` | `"low"` | The Fixer's thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. |
+| `prompterize.clarity.enabled` | `true` | Whether typed prompts carry the Clarity note. `false` leaves it out while the Fixer still runs. |
 
 An omitted setting takes its default. A thinking level pi does not offer falls back to the
 default level. A model that pi cannot find sends the prompt on unchanged.
@@ -111,8 +131,8 @@ npm test
 
 The tests drive the seam the Spec names: a real pi session that loads the extension, with a
 test provider at the provider edge playing both the Fixer's model and the main model, under a
-temporary `HOME`, `XDG_DATA_HOME` and git repo. They check what the main model received and
-what the Correction log holds, not how the extension is built.
+temporary `HOME`, `XDG_DATA_HOME` and git repo. They check what the main model received,
+including the Clarity note, and what the Correction log holds, not how the extension is built.
 
 ## Where this comes from
 

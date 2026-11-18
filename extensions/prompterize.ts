@@ -3,13 +3,18 @@
  * typos before the main agent reads it. The Boss's words are the only thing that changes;
  * nothing is added to the prompt to say what changed.
  *
+ * A typed prompt that was not skipped also gets the Clarity note in its run's system prompt,
+ * so the main agent knows to act at once on a clear prompt and to ask one Question round
+ * when it is unclear.
+ *
  * Each Fixer run also goes to the Correction log, one JSONL file outside every repo, for a
  * later, smarter model to study the Boss's typing. The log is a study aid: when it cannot be
  * written, the prompt still goes on.
  *
- * The seam is the real pi session (see tests/prompterize.test.ts): this file only wires pi's
- * `input` event to the Fixer, and the Fixer speaks to its model through
- * `ctx.modelRegistry.streamSimple()`, so pi's own credentials are used.
+ * The seam is the real pi session (see tests/prompterize.test.ts): this file wires pi's
+ * `input` and `before_agent_start` events to the Fixer and the Clarity note, and the Fixer
+ * speaks to its model through `ctx.modelRegistry.streamSimple()`, so pi's own credentials
+ * are used.
  */
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
@@ -26,6 +31,7 @@ const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "med
 /** What pi's settings.json holds under the prompterize key. */
 type PrompterizeSettings = {
 	fixer?: { enabled?: boolean; model?: string; thinkingLevel?: string };
+	clarity?: { enabled?: boolean };
 };
 
 /**
@@ -42,6 +48,44 @@ const DEFAULT_FIXER: FixerSettings = {
 	model: "opencode-go/deepseek-v4.1-flash",
 	thinkingLevel: "low",
 };
+
+/**
+ * The Clarity note, adapted from severity1's claude-code-prompt-improver evaluation wrapper.
+ *
+ * MIT License
+ *
+ * Copyright (c) 2025 severity1
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ * The note goes into the system prompt of a run started by a typed prompt that was not
+ * skipped. It asks the main agent to judge the prompt before acting, to look things up for
+ * itself, and to ask one Question round in the grilling skill's format when the prompt is
+ * unclear. A clear prompt costs one judgement and no question.
+ */
+const CLARITY_NOTE = `Clarity note: before acting, judge whether this prompt is clear enough to act on.
+
+- If it is clear, or the context makes the intent plain, proceed at once and do the work. Do not ask anything.
+- If it is not clear, first look up what you can find for yourself: the code, the docs, the Beads and the conversation so far. Then ask exactly one Question round in the grilling skill's format: numbered questions, each with a suggested answer, worded so "yes" accepts every suggestion. Wait for the answer before working. Ask only what the Boss alone can answer.
+- If the prompt starts a whole new feature or project, run the grilling skill in full instead of a single Question round.
+
+Do not add or call a tool for this; ask the questions in your reply.`;
 
 /** One replacement the Fixer made, kept for the Correction log. */
 type FixerChange = { from: string; to: string };
@@ -89,15 +133,25 @@ Rules:
 {"text":"<the prompt with its typos fixed>","changes":[{"from":"<the text as typed>","to":"<the text after fixing>"}]}
 - The changes list holds one entry for each fix, with the original and the fixed word or phrase.`;
 
-/** The prompterize settings, read from pi's effective settings with the defaults filled in. */
+/** The prompterize settings pi holds, before any default is filled in. */
+function prompterizeSettings(settings: PiSettings): PrompterizeSettings {
+	return (settings as { prompterize?: PrompterizeSettings }).prompterize ?? {};
+}
+
+/** The Fixer's resolved settings, after defaults and validation. */
 function fixerSettings(settings: PiSettings): FixerSettings {
-	const fixer = (settings as { prompterize?: PrompterizeSettings }).prompterize?.fixer ?? {};
+	const fixer = prompterizeSettings(settings).fixer ?? {};
 	const thinkingLevel = THINKING_LEVELS.find((level) => level === fixer.thinkingLevel) ?? DEFAULT_FIXER.thinkingLevel;
 	return {
 		enabled: typeof fixer.enabled === "boolean" ? fixer.enabled : DEFAULT_FIXER.enabled,
 		model: typeof fixer.model === "string" && fixer.model.length > 0 ? fixer.model : DEFAULT_FIXER.model,
 		thinkingLevel,
 	};
+}
+
+/** Whether runs started by a typed prompt carry the Clarity note; on unless the settings say otherwise. */
+function clarityEnabled(settings: PiSettings): boolean {
+	return prompterizeSettings(settings).clarity?.enabled ?? true;
 }
 
 /** Split "provider/model" at its first slash, as pi names a model in settings. */
@@ -223,17 +277,38 @@ async function logFixerRun(
 }
 
 export default function prompterize(pi: ExtensionAPI): void {
+	/**
+	 * The text of the next run's prompt when that run should carry the Clarity note, or null.
+	 * The input handler sets it; `before_agent_start` consumes it, and matches it against the
+	 * run's prompt so a run started by another extension or RPC can never pick it up.
+	 */
+	let promptForClarityNote: string | null = null;
+
+	pi.on("before_agent_start", (event) => {
+		const prompt = promptForClarityNote;
+		promptForClarityNote = null;
+		if (event.messageType !== "user") return;
+		if (prompt === null || event.prompt !== prompt) return;
+		event.systemPromptOptions.sections.clarity_note = CLARITY_NOTE;
+	});
+
 	pi.on("input", async (event, ctx) => {
+		promptForClarityNote = null;
 		// Only the Boss's own typing is a typed prompt (GLOSSARY.md).
 		if (event.source !== "interactive") return { action: "continue" };
-		// Slash commands are pi's, not the Fixer's.
+		// Slash commands are pi's, not the Fixer's, and carry no Clarity note.
 		if (event.text.startsWith("/")) return { action: "continue" };
 		// The Skip prefix sends the rest with neither the Fixer nor the Clarity note.
 		if (event.text.startsWith("*")) return { action: "transform", text: event.text.slice(1) };
-		const settings = fixerSettings(pi.getSettings());
-		if (!settings.enabled) return { action: "continue" };
-		const run = await fixPrompt(ctx, event.text, settings);
-		await logFixerRun(pi, ctx, settings, event.text, run);
-		return run.outcome === "fixed" ? { action: "transform", text: run.fixed } : { action: "continue" };
+		const piSettings = pi.getSettings();
+		const settings = fixerSettings(piSettings);
+		let text = event.text;
+		if (settings.enabled) {
+			const run = await fixPrompt(ctx, event.text, settings);
+			await logFixerRun(pi, ctx, settings, event.text, run);
+			if (run.outcome === "fixed") text = run.fixed;
+		}
+		if (clarityEnabled(piSettings)) promptForClarityNote = text;
+		return text === event.text ? { action: "continue" } : { action: "transform", text };
 	});
 }

@@ -18,6 +18,7 @@ import { appendFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	createAssistantMessageEventStream,
+	getSystemMessageText,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
@@ -67,17 +68,27 @@ const message = (requested: Model<Api>, text: string, failure?: string): Assista
 	timestamp: Date.now(),
 });
 
+/**
+ * The system prompt a request carries: the context's plain prompt, then each system message
+ * rendered as pi renders it, sections included. A system message that patches named prompt
+ * sections carries no text in `content`, so skipping the sections would hide it.
+ */
+function systemOf(context: Context): string {
+	const systemMessages = context.messages.flatMap((message) =>
+		message.role === "system" ? [getSystemMessageText(message)] : [],
+	);
+	return [context.systemPrompt ?? "", ...systemMessages].filter(Boolean).join("\n");
+}
+
 /** The one request the log records, so a test can see what a model was sent. */
 function record(requested: Model<Api>, context: Context, options?: SimpleStreamOptions): void {
-	const systemMessages = context.messages.filter((message) => message.role === "system").map(textOf);
-	const system = [context.systemPrompt ?? "", ...systemMessages].filter(Boolean).join("\n");
 	appendFileSync(
 		log,
 		`${JSON.stringify({
 			provider: requested.provider,
 			model: requested.id,
 			reasoning: options?.reasoning ?? null,
-			system,
+			system: systemOf(context),
 			messages: context.messages.filter((message) => message.role !== "system").map(textOf),
 		})}\n`,
 	);
