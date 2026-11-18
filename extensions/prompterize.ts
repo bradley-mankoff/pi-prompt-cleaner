@@ -11,12 +11,18 @@
  * later, smarter model to study the Boss's typing. The log is a study aid: when it cannot be
  * written, the prompt still goes on.
  *
+ * Text the Boss wrote or chose on purpose is never the Fixer's to change: each code fence, inline
+ * code span, blockquote line, URL and @ reference is swapped for a random placeholder before the
+ * model call, and put back byte for byte after it. A reply that mishandles a placeholder is
+ * rejected by a plain string comparison, and the prompt goes on as typed with the run logged as
+ * an error.
+ *
  * The seam is the real pi session (see tests/prompterize.test.ts): this file wires pi's
  * `input` and `before_agent_start` events to the Fixer and the Clarity note, and the Fixer
  * speaks to its model through `ctx.modelRegistry.streamSimple()`, so pi's own credentials
  * are used.
  */
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -129,6 +135,7 @@ const INSTRUCTIONS = `You are the Fixer in pi-prompterize. Fix the spelling mist
 Rules:
 - Fix typos and change nothing else. Do not reword, reorder, shorten, expand or add content.
 - Keep the user's meaning, language, punctuation, capitalisation and layout as they are apart from the typos.
+- Text in a placeholder such as ⟦prompterize:...⟧ was written or chosen by the user on purpose. Copy each placeholder exactly once, exactly as it is, and add no placeholder of your own.
 - Reply with JSON only, with no code fence and no explanation, in exactly this shape:
 {"text":"<the prompt with its typos fixed>","changes":[{"from":"<the text as typed>","to":"<the text after fixing>"}]}
 - The changes list holds one entry for each fix, with the original and the fixed word or phrase.`;
@@ -182,6 +189,205 @@ function parseReply(raw: string): FixerReply {
 	return { text: fixed, changes: checked };
 }
 
+/** Half-open `[start, stop)`: where a line or a span starts, and where it ends. */
+type Range = { start: number; stop: number };
+
+/** One protected span, and the placeholder that stands in for it in the Fixer's request. */
+type ProtectedSpan = { placeholder: string; span: string };
+
+/** The prompt as the Fixer's model sees it, and the spans its placeholders stand for. */
+type ProtectedPrompt = { text: string; spans: ProtectedSpan[] };
+
+/** The marks that fence a placeholder, so the request and the guard cannot spell one differently. */
+const PLACEHOLDER_OPEN = "⟦prompterize:";
+const PLACEHOLDER_CLOSE = "⟧";
+
+/**
+ * The shape of every placeholder: the open mark, a hex token random to one request, the span's
+ * index and the close mark. A reply may carry no token of this shape except the ones this request
+ * made, so the guard can tell a placeholder the model invented from ordinary text. It is built from
+ * the same marks the request is built from, so the two cannot drift apart.
+ */
+const PLACEHOLDER_SHAPE = new RegExp(`${PLACEHOLDER_OPEN}[0-9a-f]+:\\d+${PLACEHOLDER_CLOSE}`, "g");
+
+/**
+ * One prompt's claimed spans: the mask says which characters an earlier kind already holds, and the
+ * ranges are the spans themselves. Kinds claim in turn, and a caller never sees the mask.
+ */
+type SpanClaims = {
+	/** Take `[start, stop)` as one span, unless a span claimed earlier already holds part of it. */
+	take(start: number, stop: number): boolean;
+	/** Whether the character at `index` sits inside a claimed span. */
+	holds(index: number): boolean;
+	/** Every claimed span, in the order it was taken. */
+	readonly ranges: Range[];
+};
+
+/** The claims of one prompt, `length` characters long, with nothing claimed yet. */
+function spanClaims(length: number): SpanClaims {
+	const covered = new Uint8Array(length);
+	const ranges: Range[] = [];
+	return {
+		take(start, stop) {
+			if (stop <= start) return false;
+			for (let i = start; i < stop; i += 1) if (covered[i] === 1) return false;
+			for (let i = start; i < stop; i += 1) covered[i] = 1;
+			ranges.push({ start, stop });
+			return true;
+		},
+		holds: (index) => covered[index] === 1,
+		ranges,
+	};
+}
+
+/** Where each line of the prompt starts, and where its newline or the prompt ends. */
+function linesOf(text: string): Range[] {
+	const lines: Range[] = [];
+	let start = 0;
+	while (start <= text.length) {
+		const newline = text.indexOf("\n", start);
+		const stop = newline < 0 ? text.length : newline;
+		lines.push({ start, stop });
+		if (newline < 0) break;
+		start = newline + 1;
+	}
+	return lines;
+}
+
+/**
+ * Swap each protected span for its own placeholder, so the Fixer's model can fix the words around
+ * them but never touch them. The spans are claimed in turn, earlier kinds first, so a blockquote
+ * line keeps the inline code inside it and a code fence keeps the URL-shaped text inside it.
+ * Placeholders carry a token random to this request, so a reply can only ever answer this prompt.
+ */
+function protectSpans(prompt: string): ProtectedPrompt {
+	const token = randomBytes(6).toString("hex");
+	const claims = spanClaims(prompt.length);
+	claimFencedBlocks(prompt, claims);
+	claimBlockquoteLines(prompt, claims);
+	claimInlineCode(prompt, claims);
+	claimUrls(prompt, claims);
+	claimAtReferences(prompt, claims);
+	const ranges = [...claims.ranges].sort((left, right) => left.start - right.start);
+	const spans: ProtectedSpan[] = [];
+	let text = "";
+	let end = 0;
+	for (const { start, stop } of ranges) {
+		const placeholder = `${PLACEHOLDER_OPEN}${token}:${spans.length}${PLACEHOLDER_CLOSE}`;
+		spans.push({ placeholder, span: prompt.slice(start, stop) });
+		text += prompt.slice(end, start) + placeholder;
+		end = stop;
+	}
+	return { text: text + prompt.slice(end), spans };
+}
+
+/**
+ * Claim each code fence, from its opening line through its closing line, or through the prompt's
+ * end when it has no closing line. A closing fence is at least as long as its opener and carries
+ * nothing else.
+ */
+function claimFencedBlocks(text: string, claims: SpanClaims): void {
+	let open: { start: number; fence: string } | undefined;
+	for (const line of linesOf(text)) {
+		const body = text.slice(line.start, line.stop);
+		const fence = /^\s*(`{3,}|~{3,})/.exec(body)?.[1];
+		if (open === undefined) {
+			if (fence !== undefined) open = { start: line.start, fence };
+			continue;
+		}
+		const closes = fence !== undefined && fence[0] === open.fence[0] && fence.length >= open.fence.length && body.trim() === fence;
+		if (!closes) continue;
+		claims.take(open.start, line.stop);
+		open = undefined;
+	}
+	if (open !== undefined) claims.take(open.start, text.length);
+}
+
+/** Claim each blockquote line whole: the Boss quoted that text, so none of it is the Fixer's. */
+function claimBlockquoteLines(text: string, claims: SpanClaims): void {
+	for (const line of linesOf(text)) {
+		if (/^\s*>/.test(text.slice(line.start, line.stop))) claims.take(line.start, line.stop);
+	}
+}
+
+/**
+ * Claim each inline code span: a run of backticks, its text, and a closing run of the same length.
+ * A run with no partner is ordinary text, and a partner inside a fence or another span is not one
+ * this span may use.
+ */
+function claimInlineCode(text: string, claims: SpanClaims): void {
+	for (let i = 0; i < text.length; i += 1) {
+		if (text[i] !== "`" || claims.holds(i)) continue;
+		let length = 0;
+		while (text[i + length] === "`") length += 1;
+		for (let j = i + length; j < text.length; ) {
+			if (text[j] !== "`") {
+				j += 1;
+				continue;
+			}
+			if (claims.holds(j)) break;
+			let closing = 0;
+			while (text[j + closing] === "`") closing += 1;
+			if (closing !== length) {
+				j += closing;
+				continue;
+			}
+			if (claims.take(i, j + closing)) i = j + closing - 1;
+			break;
+		}
+	}
+}
+
+/** Claim each http(s) URL, leaving the sentence's punctuation and any unbalanced closing bracket outside. */
+function claimUrls(text: string, claims: SpanClaims): void {
+	for (const match of text.matchAll(/https?:\/\/[^\s<>"'`]+/g)) {
+		const start = match.index;
+		let stop = start + match[0].length;
+		while (stop > start && ".,;:!?'\"".includes(text[stop - 1])) stop -= 1;
+		for (const [opening, closing] of [
+			["(", ")"],
+			["[", "]"],
+		]) {
+			while (stop > start && text[stop - 1] === closing) {
+				const url = text.slice(start, stop - 1);
+				if (url.split(opening).length > url.split(closing).length) break;
+				stop -= 1;
+			}
+		}
+		claims.take(start, stop);
+	}
+}
+
+/** Claim each @ reference, such as @src/file.ts, but never the @ of an email address. */
+function claimAtReferences(text: string, claims: SpanClaims): void {
+	for (const match of text.matchAll(/@[A-Za-z0-9_][A-Za-z0-9_./-]*/g)) {
+		const start = match.index;
+		if (start > 0 && /[\w.+-]/.test(text[start - 1])) continue;
+		claims.take(start, start + match[0].length);
+	}
+}
+
+/**
+ * Check the Fixer's reply against the placeholders this request made: each must appear exactly
+ * once, unchanged, and the reply must invent none of its own. This is a plain string comparison,
+ * not a model's judgement, so a reply that fails it can be rejected outright.
+ */
+function checkPlaceholders(reply: string, spans: ProtectedSpan[]): void {
+	for (const { placeholder } of spans) {
+		const kept = reply.split(placeholder).length - 1;
+		if (kept !== 1) throw new Error(`the Fixer's reply must keep each protected placeholder exactly once, unchanged: ${placeholder} appears ${kept} times`);
+	}
+	const known = new Set(spans.map(({ placeholder }) => placeholder));
+	for (const found of reply.match(PLACEHOLDER_SHAPE) ?? []) {
+		if (!known.has(found)) throw new Error(`the Fixer's reply invented the placeholder ${found}`);
+	}
+}
+
+/** Put each protected span back in place of its placeholder. */
+function restoreSpans(text: string, spans: ProtectedSpan[]): string {
+	return spans.reduce((restored, { placeholder, span }) => restored.split(placeholder).join(span), text);
+}
+
 /**
  * Send one prompt to the Fixer's model and return what the run did to it. The result is total:
  * a failure comes back as the error outcome, so the caller never has to catch one.
@@ -193,19 +399,25 @@ async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerS
 		const { provider, id } = splitModel(settings.model);
 		const model: Model<Api> | undefined = ctx.modelRegistry.find(provider, id);
 		if (!model) throw new Error(`the Fixer's model ${settings.model} is not available`);
+		const protectedPrompt = protectSpans(prompt);
 		const context: Context = {
 			systemPrompt: INSTRUCTIONS,
-			messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: started }],
+			messages: [{ role: "user", content: [{ type: "text", text: protectedPrompt.text }], timestamp: started }],
 		};
 		const reply = await ctx.modelRegistry.streamSimple(model, context, { reasoning: settings.thinkingLevel }).result();
 		if (reply.stopReason !== "stop") throw new Error(reply.errorMessage ?? `the Fixer stopped with ${reply.stopReason}`);
-		const fixed = parseReply(textOf(reply));
+		const parsed = parseReply(textOf(reply));
+		checkPlaceholders(parsed.text, protectedPrompt.spans);
+		const fixed = restoreSpans(parsed.text, protectedPrompt.spans);
 		return {
 			time,
 			durationMs: Date.now() - started,
-			outcome: fixed.text === prompt ? "unchanged" : "fixed",
-			fixed: fixed.text,
-			changes: fixed.changes,
+			outcome: fixed === prompt ? "unchanged" : "fixed",
+			fixed,
+			changes: parsed.changes.map((change) => ({
+				from: restoreSpans(change.from, protectedPrompt.spans),
+				to: restoreSpans(change.to, protectedPrompt.spans),
+			})),
 		};
 	} catch (failure) {
 		return {

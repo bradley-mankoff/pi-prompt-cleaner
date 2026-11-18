@@ -16,6 +16,14 @@ _Avoid_: rewriter, enhancer, optimizer
 A symbol from the repo's GitNexus index, or a file path from git's file list when the repo has no index, that the Fixer may map a typed word to.
 _Avoid_: identifier, candidate
 
+**Protected span**:
+Text the Boss wrote or chose on purpose, which the Fixer may never change: a code fence, inline code, a blockquote line, a URL or an `@` reference.
+_Avoid_: ignored text, skip region, mask
+
+**Placeholder**:
+An opaque token, random to one Fixer request, that stands in for one protected span in the prompt the Fixer's model sees and is swapped back for that span after the reply passes the guard.
+_Avoid_: marker, sentinel
+
 **Possibly hint**:
 The words "(possibly `A` or `B`)" the Fixer adds after a word it cannot map with confidence, leaving the word itself unchanged so the main agent checks for itself.
 _Avoid_: likely hint, suggestion
