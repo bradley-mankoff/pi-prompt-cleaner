@@ -31,6 +31,27 @@ as are slash commands.
 The Fixer has no timeout. If its model call fails, or the reply cannot be used, the prompt
 goes on unchanged, so a broken Fixer never blocks your work.
 
+### Protected spans
+
+Text you wrote or chose on purpose is never the Fixer's to change. Before its model call, the
+Fixer swaps each of these spans for an opaque placeholder that is random to that request, and puts
+each span back afterwards, byte for byte:
+
+- a code fence, from its opening line to its closing line;
+- inline code, between a run of backticks and a closing run of the same length;
+- a blockquote line, one that starts with `>`;
+- an `http://` or `https://` URL;
+- an `@` reference, such as `@src/parser.ts`.
+
+The Fixer's model is told to keep every placeholder exactly as it is. The extension then checks
+the reply by plain string comparison, not with a model: each placeholder must appear exactly once,
+unchanged, and the reply may add none of its own. A reply that fails the check is rejected, the
+Correction log records the outcome as `error`, and the prompt goes on exactly as typed.
+
+pi's `input` event carries a prompt's text, its images and where it came from, but nothing that
+says which part of the text was pasted. Pasted text that is none of the spans above is therefore
+fixed like typed text.
+
 ### Skip prefix
 
 Start a typed prompt with `*` to send it without the Fixer and without the Clarity note. The

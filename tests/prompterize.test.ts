@@ -427,6 +427,56 @@ test("the Fixer's instructions tell its model to fix typos and change nothing el
 	assert.equal(fixer[0].messages.at(-1), "pleas fix teh bug in teh parser", "the model saw the prompt as typed");
 });
 
+/**
+ * A typed prompt with one of each protected span. The typo "teh" sits inside every span as well as
+ * outside them, so a Fixer that saw a span would change it; only the two typos outside may change.
+ */
+const typedWithProtectedSpans = [
+	"pleas fix teh build in the parser",
+	"",
+	"Use `tehConfig` and mind the fence:",
+	"",
+	"```ts",
+	"const teh = 1;",
+	"```",
+	"",
+	"> teh quoted complaint, kept as it was",
+	"",
+	"Read https://example.com/docs/teh-config and @src/teh-config.ts first.",
+].join("\n");
+
+/** The same prompt with its two typos outside the spans fixed, and every span byte for byte as typed. */
+const fixedWithProtectedSpans = [
+	"Please fix the build in the parser",
+	"",
+	"Use `tehConfig` and mind the fence:",
+	"",
+	"```ts",
+	"const teh = 1;",
+	"```",
+	"",
+	"> teh quoted complaint, kept as it was",
+	"",
+	"Read https://example.com/docs/teh-config and @src/teh-config.ts first.",
+].join("\n");
+
+/** The two fixes the test's Fixer model makes, as the from/to pairs it reports back. */
+const protectedSpanFixes = JSON.stringify([
+	{ from: "pleas", to: "Please" },
+	{ from: "teh", to: "the" },
+]);
+
+test("code fences, inline code, blockquote lines, URLs and @ references reach the main model byte for byte, while typos around them are fixed", () => {
+	const workspace = makeWorkspace();
+	const run = runPi(workspace, typedWithProtectedSpans, {
+		PROMPTERIZE_TEST_FIX_SUBSTITUTIONS: protectedSpanFixes,
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1, "the prompt reached the main model once");
+	assert.equal(main[0].messages.at(-1), fixedWithProtectedSpans);
+});
+
 test("a fixed prompt appends one Fixer record to the Correction log under XDG_DATA_HOME", () => {
 	const workspace = makeWorkspace();
 	const typed = "pleas fix teh bug in teh parser";
@@ -562,3 +612,63 @@ test("a Correction log that cannot be written leaves the prompt to go on", () =>
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt still reached the main model");
 });
+
+test("the Fixer's model sees a placeholder in place of each protected span and never the span itself", () => {
+	const workspace = makeWorkspace();
+	const run = runPi(workspace, typedWithProtectedSpans, {
+		PROMPTERIZE_TEST_FIX_SUBSTITUTIONS: protectedSpanFixes,
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	const request = fixer[0].messages.at(-1) ?? "";
+	const spans = [
+		"`tehConfig`",
+		["```ts", "const teh = 1;", "```"].join("\n"),
+		"> teh quoted complaint, kept as it was",
+		"https://example.com/docs/teh-config",
+		"@src/teh-config.ts",
+	];
+	for (const span of spans) {
+		assert.equal(request.includes(span), false, `the Fixer's model did not see ${JSON.stringify(span)}`);
+	}
+	assert.equal(request.match(/⟦prompterize:[0-9a-f]+:\d+⟧/g)?.length, spans.length, "each span became its own placeholder");
+});
+
+test("each request gets placeholders of its own, so a reply can only ever answer the prompt it was made for", () => {
+	const workspace = makeWorkspace();
+	const first = runPi(workspace, typedWithProtectedSpans, { PROMPTERIZE_TEST_FIX_SUBSTITUTIONS: protectedSpanFixes });
+	assert.equal(first.status, 0, first.stderr);
+	const second = runPi(workspace, typedWithProtectedSpans, { PROMPTERIZE_TEST_FIX_SUBSTITUTIONS: protectedSpanFixes });
+	assert.equal(second.status, 0, second.stderr);
+	const placeholders = reached(workspace, "opencode-go").map(
+		(request) => request.messages.at(-1)?.match(/⟦prompterize:[0-9a-f]+:\d+⟧/g) ?? [],
+	);
+	assert.equal(placeholders.length, 2, "both prompts reached the Fixer's model");
+	assert.notDeepEqual(placeholders[0], placeholders[1], "the placeholders differ from one request to the next");
+});
+
+/** The ways a Fixer reply can mishandle a placeholder, each with the word a test name uses for it. */
+const placeholderMishandlings = [
+	{ mutation: "drop", verb: "drops" },
+	{ mutation: "change", verb: "changes" },
+	{ mutation: "duplicate", verb: "duplicates" },
+	{ mutation: "add", verb: "adds" },
+] as const;
+
+for (const { mutation, verb } of placeholderMishandlings) {
+	test(`a Fixer reply that ${verb} a placeholder is rejected, so the prompt goes on as typed and the Correction log records error`, () => {
+		const workspace = makeWorkspace();
+		const run = runPi(workspace, typedWithProtectedSpans, {
+			PROMPTERIZE_TEST_FIX_PLACEHOLDER_MUTATION: mutation,
+		});
+		assert.equal(run.status, 0, run.stderr);
+		const main = reached(workspace, "prompterize-test");
+		assert.equal(main.length, 1, "the prompt reached the main model once");
+		assert.equal(main[0].messages.at(-1), typedWithProtectedSpans, "the main model received the prompt exactly as typed");
+		const records = correctionRecords(correctionLog(workspace));
+		assert.equal(records.length, 1, "the rejected run was logged");
+		assert.equal(records[0].outcome, "error", "a rejected reply is an error outcome");
+		assert.match(records[0].error ?? "", /placeholder/i, "the record says a placeholder was mishandled");
+	});
+}

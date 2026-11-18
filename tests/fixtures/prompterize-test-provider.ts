@@ -5,6 +5,15 @@
  * in PROMPTERIZE_TEST_FIX, after PROMPTERIZE_TEST_FIX_DELAY_MS milliseconds when a test sets
  * that, or fails with PROMPTERIZE_TEST_FIX_FAILURE.
  *
+ * A test that cannot know its reply in advance, because the protected spans carry random
+ * placeholders, sets one of two other Fixer replies instead:
+ *
+ * - PROMPTERIZE_TEST_FIX_SUBSTITUTIONS, a JSON list of from/to pairs: the model applies them
+ *   to the prompt it received, as a model that fixed those typos would.
+ * - PROMPTERIZE_TEST_FIX_PLACEHOLDER_MUTATION, one of "drop", "change", "duplicate" or
+ *   "add": the model mishandles the first placeholder, as a model ignoring its instructions
+ *   would, so a test can see the extension reject the reply.
+ *
  * Each model has its own stream function, so neither has to ask which model it is playing.
  * Every request is written as one JSON object a line to PROMPTERIZE_TEST_LOG, with the
  * provider, model, thinking level, system prompt and message text, so a test can see what
@@ -31,9 +40,58 @@ const api = "prompterize-test";
 const log = process.env.PROMPTERIZE_TEST_LOG ?? "/dev/null";
 const mainReply = process.env.PROMPTERIZE_TEST_REPLY ?? "answered";
 const fixReply = process.env.PROMPTERIZE_TEST_FIX ?? '{"text":"fixed","changes":[]}';
+const fixSubstitutions = process.env.PROMPTERIZE_TEST_FIX_SUBSTITUTIONS;
+const fixPlaceholderMutation = process.env.PROMPTERIZE_TEST_FIX_PLACEHOLDER_MUTATION;
 const fixDelay = Number(process.env.PROMPTERIZE_TEST_FIX_DELAY_MS ?? "0");
 const fixFailure = process.env.PROMPTERIZE_TEST_FIX_FAILURE;
 const extensionText = process.env.PROMPTERIZE_TEST_EXTENSION_TEXT ?? "sent by an extension";
+
+/**
+ * The placeholders the Fixer's request carries: the protected spans the extension swapped out.
+ * A test provider playing a real model sees these tokens in the prompt and has to keep them.
+ */
+const placeholderPattern = /⟦prompterize:[0-9a-f]+:\d+⟧/g;
+
+/**
+ * The Fixer's reply to one request. A substitution or mutation reply is built from the prompt the
+ * model received, because only then does the reply carry the random placeholders of this request.
+ */
+function fixReplyFor(prompt: string): string {
+	if (fixSubstitutions !== undefined) {
+		const substitutions = JSON.parse(fixSubstitutions) as { from: string; to: string }[];
+		const text = substitutions.reduce((current, { from, to }) => current.split(from).join(to), prompt);
+		return JSON.stringify({ text, changes: substitutions });
+	}
+	if (fixPlaceholderMutation !== undefined) {
+		return JSON.stringify({ text: mutatePlaceholder(prompt, fixPlaceholderMutation), changes: [] });
+	}
+	return fixReply;
+}
+
+/** A reply that mishandles the first placeholder, as a model that ignored its guard would. */
+function mutatePlaceholder(prompt: string, mutation: string): string {
+	const [first] = prompt.match(placeholderPattern) ?? [];
+	if (first === undefined) return prompt;
+	switch (mutation) {
+		case "drop":
+			return prompt.replace(first, "");
+		case "change":
+			return prompt.replace(first, first.replace(/:\d+⟧$/, ":9⟧"));
+		case "duplicate":
+			return prompt.replace(first, `${first}${first}`);
+		case "add":
+			return `${prompt}\n⟦prompterize:ffffffffffff:9⟧`;
+		default:
+			return prompt;
+	}
+}
+
+/** The text of the latest message the request carries, which is the prompt the model answers. */
+function promptOf(context: Context): string {
+	const messages = context.messages.filter((message) => message.role === "user");
+	const last = messages.at(-1);
+	return last === undefined ? "" : textOf(last);
+}
 
 /** The provider that stands in for the Fixer's model. */
 const fixerProvider = "opencode-go";
@@ -117,7 +175,7 @@ export default function prompterizeTestProvider(pi: ExtensionAPI): void {
 	/** The Fixer's model: the reply the test set, after its delay, or the failure the test asked for. */
 	const fixerStream = (requested: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
 		record(requested, context, options);
-		return replyOf(requested, fixReply, fixFailure, fixDelay);
+		return replyOf(requested, fixReplyFor(promptOf(context)), fixFailure, fixDelay);
 	};
 	/** The main model: always answers, so a test can read what the main agent received. */
 	const mainStream = (requested: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
