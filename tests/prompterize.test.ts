@@ -215,6 +215,9 @@ function requests(workspace: Workspace): Request[] {
 const reached = (workspace: Workspace, provider: string): Request[] =>
 	requests(workspace).filter((request) => request.provider === provider);
 
+/** The placeholders one text carries, in the order they appear. */
+const placeholdersIn = (text: string): string[] => text.match(/⟦prompterize:[0-9a-f]+:\d+⟧/g) ?? [];
+
 /** One Fixer record, as the Bead names its fields. */
 type FixerRecord = {
 	id: string;
@@ -632,7 +635,7 @@ test("the Fixer's model sees a placeholder in place of each protected span and n
 	for (const span of spans) {
 		assert.equal(request.includes(span), false, `the Fixer's model did not see ${JSON.stringify(span)}`);
 	}
-	assert.equal(request.match(/⟦prompterize:[0-9a-f]+:\d+⟧/g)?.length, spans.length, "each span became its own placeholder");
+	assert.equal(placeholdersIn(request).length, spans.length, "each span became its own placeholder");
 });
 
 test("each request gets placeholders of its own, so a reply can only ever answer the prompt it was made for", () => {
@@ -641,9 +644,7 @@ test("each request gets placeholders of its own, so a reply can only ever answer
 	assert.equal(first.status, 0, first.stderr);
 	const second = runPi(workspace, typedWithProtectedSpans, { PROMPTERIZE_TEST_FIX_SUBSTITUTIONS: protectedSpanFixes });
 	assert.equal(second.status, 0, second.stderr);
-	const placeholders = reached(workspace, "opencode-go").map(
-		(request) => request.messages.at(-1)?.match(/⟦prompterize:[0-9a-f]+:\d+⟧/g) ?? [],
-	);
+	const placeholders = reached(workspace, "opencode-go").map((request) => placeholdersIn(request.messages.at(-1) ?? ""));
 	assert.equal(placeholders.length, 2, "both prompts reached the Fixer's model");
 	assert.notDeepEqual(placeholders[0], placeholders[1], "the placeholders differ from one request to the next");
 });

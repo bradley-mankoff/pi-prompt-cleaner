@@ -189,11 +189,8 @@ function parseReply(raw: string): FixerReply {
 	return { text: fixed, changes: checked };
 }
 
-/**
- * The shape of every placeholder. A reply may carry no token of this shape except the ones this
- * request made, so the guard can tell a placeholder the model invented from ordinary text.
- */
-const PLACEHOLDER_SHAPE = /⟦prompterize:[0-9a-f]+:\d+⟧/g;
+/** Half-open `[start, stop)`: where a line or a span starts, and where it ends. */
+type Range = { start: number; stop: number };
 
 /** One protected span, and the placeholder that stands in for it in the Fixer's request. */
 type ProtectedSpan = { placeholder: string; span: string };
@@ -201,14 +198,56 @@ type ProtectedSpan = { placeholder: string; span: string };
 /** The prompt as the Fixer's model sees it, and the spans its placeholders stand for. */
 type ProtectedPrompt = { text: string; spans: ProtectedSpan[] };
 
-/** Where one line of the prompt starts, and where its newline or the prompt ends. */
-function linesOf(text: string): { start: number; end: number }[] {
-	const lines: { start: number; end: number }[] = [];
+/** The marks that fence a placeholder, so the request and the guard cannot spell one differently. */
+const PLACEHOLDER_OPEN = "⟦prompterize:";
+const PLACEHOLDER_CLOSE = "⟧";
+
+/**
+ * The shape of every placeholder: the open mark, a hex token random to one request, the span's
+ * index and the close mark. A reply may carry no token of this shape except the ones this request
+ * made, so the guard can tell a placeholder the model invented from ordinary text. It is built from
+ * the same marks the request is built from, so the two cannot drift apart.
+ */
+const PLACEHOLDER_SHAPE = new RegExp(`${PLACEHOLDER_OPEN}[0-9a-f]+:\\d+${PLACEHOLDER_CLOSE}`, "g");
+
+/**
+ * One prompt's claimed spans: the mask says which characters an earlier kind already holds, and the
+ * ranges are the spans themselves. Kinds claim in turn, and a caller never sees the mask.
+ */
+type SpanClaims = {
+	/** Take `[start, stop)` as one span, unless a span claimed earlier already holds part of it. */
+	take(start: number, stop: number): boolean;
+	/** Whether the character at `index` sits inside a claimed span. */
+	holds(index: number): boolean;
+	/** Every claimed span, in the order it was taken. */
+	readonly ranges: Range[];
+};
+
+/** The claims of one prompt, `length` characters long, with nothing claimed yet. */
+function spanClaims(length: number): SpanClaims {
+	const covered = new Uint8Array(length);
+	const ranges: Range[] = [];
+	return {
+		take(start, stop) {
+			if (stop <= start) return false;
+			for (let i = start; i < stop; i += 1) if (covered[i] === 1) return false;
+			for (let i = start; i < stop; i += 1) covered[i] = 1;
+			ranges.push({ start, stop });
+			return true;
+		},
+		holds: (index) => covered[index] === 1,
+		ranges,
+	};
+}
+
+/** Where each line of the prompt starts, and where its newline or the prompt ends. */
+function linesOf(text: string): Range[] {
+	const lines: Range[] = [];
 	let start = 0;
 	while (start <= text.length) {
 		const newline = text.indexOf("\n", start);
-		const end = newline < 0 ? text.length : newline;
-		lines.push({ start, end });
+		const stop = newline < 0 ? text.length : newline;
+		lines.push({ start, stop });
 		if (newline < 0) break;
 		start = newline + 1;
 	}
@@ -223,27 +262,18 @@ function linesOf(text: string): { start: number; end: number }[] {
  */
 function protectSpans(prompt: string): ProtectedPrompt {
 	const token = randomBytes(6).toString("hex");
-	const covered = new Uint8Array(prompt.length);
-	const ranges: [number, number][] = [];
-	/** Take [start, stop) as one span, unless a span claimed earlier already holds part of it. */
-	const claim = (start: number, stop: number): boolean => {
-		if (stop <= start) return false;
-		for (let i = start; i < stop; i += 1) if (covered[i] === 1) return false;
-		for (let i = start; i < stop; i += 1) covered[i] = 1;
-		ranges.push([start, stop]);
-		return true;
-	};
-	claimFencedBlocks(prompt, claim);
-	claimBlockquoteLines(prompt, claim);
-	claimInlineCode(prompt, covered, claim);
-	claimUrls(prompt, claim);
-	claimAtReferences(prompt, claim);
-	ranges.sort((left, right) => left[0] - right[0]);
+	const claims = spanClaims(prompt.length);
+	claimFencedBlocks(prompt, claims);
+	claimBlockquoteLines(prompt, claims);
+	claimInlineCode(prompt, claims);
+	claimUrls(prompt, claims);
+	claimAtReferences(prompt, claims);
+	const ranges = [...claims.ranges].sort((left, right) => left.start - right.start);
 	const spans: ProtectedSpan[] = [];
 	let text = "";
 	let end = 0;
-	for (const [start, stop] of ranges) {
-		const placeholder = `⟦prompterize:${token}:${spans.length}⟧`;
+	for (const { start, stop } of ranges) {
+		const placeholder = `${PLACEHOLDER_OPEN}${token}:${spans.length}${PLACEHOLDER_CLOSE}`;
 		spans.push({ placeholder, span: prompt.slice(start, stop) });
 		text += prompt.slice(end, start) + placeholder;
 		end = stop;
@@ -256,10 +286,10 @@ function protectSpans(prompt: string): ProtectedPrompt {
  * end when it has no closing line. A closing fence is at least as long as its opener and carries
  * nothing else.
  */
-function claimFencedBlocks(text: string, claim: (start: number, stop: number) => boolean): void {
+function claimFencedBlocks(text: string, claims: SpanClaims): void {
 	let open: { start: number; fence: string } | undefined;
 	for (const line of linesOf(text)) {
-		const body = text.slice(line.start, line.end);
+		const body = text.slice(line.start, line.stop);
 		const fence = /^\s*(`{3,}|~{3,})/.exec(body)?.[1];
 		if (open === undefined) {
 			if (fence !== undefined) open = { start: line.start, fence };
@@ -267,16 +297,16 @@ function claimFencedBlocks(text: string, claim: (start: number, stop: number) =>
 		}
 		const closes = fence !== undefined && fence[0] === open.fence[0] && fence.length >= open.fence.length && body.trim() === fence;
 		if (!closes) continue;
-		claim(open.start, line.end);
+		claims.take(open.start, line.stop);
 		open = undefined;
 	}
-	if (open !== undefined) claim(open.start, text.length);
+	if (open !== undefined) claims.take(open.start, text.length);
 }
 
 /** Claim each blockquote line whole: the Boss quoted that text, so none of it is the Fixer's. */
-function claimBlockquoteLines(text: string, claim: (start: number, stop: number) => boolean): void {
+function claimBlockquoteLines(text: string, claims: SpanClaims): void {
 	for (const line of linesOf(text)) {
-		if (/^\s*>/.test(text.slice(line.start, line.end))) claim(line.start, line.end);
+		if (/^\s*>/.test(text.slice(line.start, line.stop))) claims.take(line.start, line.stop);
 	}
 }
 
@@ -285,9 +315,9 @@ function claimBlockquoteLines(text: string, claim: (start: number, stop: number)
  * A run with no partner is ordinary text, and a partner inside a fence or another span is not one
  * this span may use.
  */
-function claimInlineCode(text: string, covered: Uint8Array, claim: (start: number, stop: number) => boolean): void {
+function claimInlineCode(text: string, claims: SpanClaims): void {
 	for (let i = 0; i < text.length; i += 1) {
-		if (text[i] !== "`" || covered[i] === 1) continue;
+		if (text[i] !== "`" || claims.holds(i)) continue;
 		let length = 0;
 		while (text[i + length] === "`") length += 1;
 		for (let j = i + length; j < text.length; ) {
@@ -295,21 +325,21 @@ function claimInlineCode(text: string, covered: Uint8Array, claim: (start: numbe
 				j += 1;
 				continue;
 			}
-			if (covered[j] === 1) break;
+			if (claims.holds(j)) break;
 			let closing = 0;
 			while (text[j + closing] === "`") closing += 1;
 			if (closing !== length) {
 				j += closing;
 				continue;
 			}
-			if (claim(i, j + closing)) i = j + closing - 1;
+			if (claims.take(i, j + closing)) i = j + closing - 1;
 			break;
 		}
 	}
 }
 
 /** Claim each http(s) URL, leaving the sentence's punctuation and any unbalanced closing bracket outside. */
-function claimUrls(text: string, claim: (start: number, stop: number) => boolean): void {
+function claimUrls(text: string, claims: SpanClaims): void {
 	for (const match of text.matchAll(/https?:\/\/[^\s<>"'`]+/g)) {
 		const start = match.index;
 		let stop = start + match[0].length;
@@ -324,16 +354,16 @@ function claimUrls(text: string, claim: (start: number, stop: number) => boolean
 				stop -= 1;
 			}
 		}
-		claim(start, stop);
+		claims.take(start, stop);
 	}
 }
 
 /** Claim each @ reference, such as @src/file.ts, but never the @ of an email address. */
-function claimAtReferences(text: string, claim: (start: number, stop: number) => boolean): void {
+function claimAtReferences(text: string, claims: SpanClaims): void {
 	for (const match of text.matchAll(/@[A-Za-z0-9_][A-Za-z0-9_./-]*/g)) {
 		const start = match.index;
 		if (start > 0 && /[\w.+-]/.test(text[start - 1])) continue;
-		claim(start, start + match[0].length);
+		claims.take(start, start + match[0].length);
 	}
 }
 
@@ -345,7 +375,7 @@ function claimAtReferences(text: string, claim: (start: number, stop: number) =>
 function checkPlaceholders(reply: string, spans: ProtectedSpan[]): void {
 	for (const { placeholder } of spans) {
 		const kept = reply.split(placeholder).length - 1;
-		if (kept !== 1) throw new Error(`the Fixer's reply changed or moved a protected placeholder: ${placeholder} appears ${kept} times`);
+		if (kept !== 1) throw new Error(`the Fixer's reply must keep each protected placeholder exactly once, unchanged: ${placeholder} appears ${kept} times`);
 	}
 	const known = new Set(spans.map(({ placeholder }) => placeholder));
 	for (const found of reply.match(PLACEHOLDER_SHAPE) ?? []) {

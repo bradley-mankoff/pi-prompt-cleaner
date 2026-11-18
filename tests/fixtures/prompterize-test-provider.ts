@@ -36,12 +36,25 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 
+/** The ways a Fixer reply can mishandle a placeholder, as a test names one. */
+type PlaceholderMutation = "drop" | "change" | "duplicate" | "add";
+
+/**
+ * The mutation a test asked for, or none. A name outside the four fails loudly at start-up rather
+ * than leaving a test to pass while its reply does nothing.
+ */
+function placeholderMutation(name: string | undefined): PlaceholderMutation | undefined {
+	if (name === undefined) return undefined;
+	if (name === "drop" || name === "change" || name === "duplicate" || name === "add") return name;
+	throw new Error(`PROMPTERIZE_TEST_FIX_PLACEHOLDER_MUTATION is not one of drop, change, duplicate or add: ${name}`);
+}
+
 const api = "prompterize-test";
 const log = process.env.PROMPTERIZE_TEST_LOG ?? "/dev/null";
 const mainReply = process.env.PROMPTERIZE_TEST_REPLY ?? "answered";
 const fixReply = process.env.PROMPTERIZE_TEST_FIX ?? '{"text":"fixed","changes":[]}';
 const fixSubstitutions = process.env.PROMPTERIZE_TEST_FIX_SUBSTITUTIONS;
-const fixPlaceholderMutation = process.env.PROMPTERIZE_TEST_FIX_PLACEHOLDER_MUTATION;
+const fixPlaceholderMutation = placeholderMutation(process.env.PROMPTERIZE_TEST_FIX_PLACEHOLDER_MUTATION);
 const fixDelay = Number(process.env.PROMPTERIZE_TEST_FIX_DELAY_MS ?? "0");
 const fixFailure = process.env.PROMPTERIZE_TEST_FIX_FAILURE;
 const extensionText = process.env.PROMPTERIZE_TEST_EXTENSION_TEXT ?? "sent by an extension";
@@ -69,7 +82,7 @@ function fixReplyFor(prompt: string): string {
 }
 
 /** A reply that mishandles the first placeholder, as a model that ignored its guard would. */
-function mutatePlaceholder(prompt: string, mutation: string): string {
+function mutatePlaceholder(prompt: string, mutation: PlaceholderMutation): string {
 	const [first] = prompt.match(placeholderPattern) ?? [];
 	if (first === undefined) return prompt;
 	switch (mutation) {
@@ -81,8 +94,6 @@ function mutatePlaceholder(prompt: string, mutation: string): string {
 			return prompt.replace(first, `${first}${first}`);
 		case "add":
 			return `${prompt}\n⟦prompterize:ffffffffffff:9⟧`;
-		default:
-			return prompt;
 	}
 }
 
