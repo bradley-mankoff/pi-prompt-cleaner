@@ -1,11 +1,9 @@
 # pi-prompterize
 
 Prepares each prompt you type into pi before the main agent reads it. The Fixer silently
-fixes the typos in a typed prompt, and the Clarity note lets the main agent ask when a prompt
-is unclear. The main agent receives the fixed text, with no note of what changed.
-
-Later versions add real-name lookup for symbols and file paths. See the project's Beads for
-that work.
+fixes the typos in a typed prompt and maps near-miss file names to the names the repo uses, and
+the Clarity note lets the main agent ask when a prompt is unclear. The main agent receives the
+fixed text, with no note of what changed.
 
 ## Install
 
@@ -35,6 +33,25 @@ While the Fixer waits on its model, pi's status line shows **fixing prompt…**,
 busy rather than stuck. Press Esc to cancel the call: the prompt goes on exactly as you typed it,
 and the Correction log records the run as `cancelled` with the time you waited. The status is
 cleared however the call ends.
+
+### Real names
+
+Before the Fixer's model call, real-name lookup reads git's tracked file list in the repo the
+prompt was typed in. For each word in the prompt that looks like a path or symbol, it finds at
+most five real names close to it. The match ignores case, underscores, hyphens and dots, and
+allows a few wrong, missing or extra letters, so `authsession`, `auth_sesion` and
+`src/auth-sesion.ts` all find `src/auth-session.ts`.
+
+Only those close matches go to the Fixer's model, each beside the word it is close to: never the
+repo's whole file list, and never the conversation. The Fixer's model maps a word to the real
+name when it is clearly the one meant. When no real name is a confident match, it keeps the word
+as typed and adds a **possibly hint** after it, such as
+`(possibly src/auth-session.ts or src/auth-sessions.ts)`. The hint always says "possibly" and
+never "likely", so the main agent does its own analysis instead of trusting a guess.
+
+Every fix and every possibly hint, with its close matches, is listed in the Fixer's reply and
+lands in the Correction log. Real-name lookup lives in `extensions/real-names.ts`; a later version
+adds symbols from the repo's GitNexus index on top of git's file list.
 
 ### Protected spans
 
@@ -104,14 +121,18 @@ smarter model can study it. One line holds one run:
   "thinkingLevel": "low",
   "durationMs": 812,
   "outcome": "fixed",
-  "original": "pleas fix teh parser",
-  "fixed": "Please fix the parser.",
+  "original": "pleas fix teh authsesion check",
+  "fixed": "Please fix the authsesion (possibly src/auth-session.ts or src/auth-sessions.ts) check",
   "changes": [
     { "from": "pleas", "to": "Please" },
-    { "from": "teh", "to": "the" }
+    { "from": "teh", "to": "the" },
+    { "word": "authsesion", "possibly": ["src/auth-session.ts", "src/auth-sessions.ts"] }
   ]
 }
 ```
+
+Each entry in `changes` is either a typo fix as a `from`/`to` pair, or a possibly hint: the `word`
+as typed with the real names close to it.
 
 `outcome` is `fixed`, `unchanged`, `error` or `cancelled`; an error record carries the failure's
 message in `error` and the prompt as typed in `fixed`. A cancelled record carries the prompt as
