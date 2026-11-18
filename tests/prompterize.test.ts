@@ -54,15 +54,39 @@ type Repo = { path: string; remote: string; commit: string };
 
 /**
  * One temporary Mac: a HOME, an agent folder, a data folder pi writes the Correction log under
- * (XDG_DATA_HOME), a git repo with one commit to run pi in, and the test provider's log.
+ * (XDG_DATA_HOME), a folder for the stub commands a test puts on PATH, a git repo with one commit
+ * to run pi in, and the test provider's log.
  */
-type Workspace = { dir: string; home: string; agentDir: string; data: string; log: string; repo: Repo };
+type Workspace = {
+	dir: string;
+	home: string;
+	agentDir: string;
+	bin: string;
+	data: string;
+	log: string;
+	repo: Repo;
+};
 
 /**
- * What a test sets up before pi runs: the settings pi reads, the repo's remote (null for none), and
- * the files git tracks besides README.md, which are the real names the Fixer may offer.
+ * What a test sets up before pi runs: the settings pi reads, the repo's remote (null for none), the
+ * files git tracks besides README.md, which are the real names the Fixer may offer, and the answers
+ * the workspace's stub `gitnexus` command gives.
  */
-type WorkspaceOptions = { settings?: Record<string, unknown>; remote?: string | null; files?: string[] };
+type WorkspaceOptions = {
+	settings?: Record<string, unknown>;
+	remote?: string | null;
+	files?: string[];
+	gitnexus?: GitnexusOptions;
+};
+
+/**
+ * The stub `gitnexus` every workspace puts first on PATH, at the outside edge of the Fixer's
+ * second real-name source: whether it names the workspace's repo in `list`, the symbols its
+ * `cypher` answers with, whether that query fails after printing its rows, and whether the
+ * command is there at all. A workspace with no options gets a stub that lists no indexed repo,
+ * so a test never reaches the Mac's own registry.
+ */
+type GitnexusOptions = { indexesRepo?: boolean; symbols?: string[]; fails?: boolean; missing?: boolean };
 
 /** The remote a temporary repo has unless its test says otherwise. */
 const TEST_REMOTE = "https://example.com/boss/pi-prompterize-test.git";
@@ -119,14 +143,66 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 		remote: remote ?? "",
 		commit: git(dir, ["rev-parse", "HEAD"]),
 	};
-	const workspace = { dir, home, agentDir, data: join(dir, "data"), log, repo };
+	// Made after the commit, so the stub command a test writes is never one of the tracked files.
+	const bin = join(dir, "bin");
+	mkdirSync(bin, { recursive: true });
+	const workspace = { dir, home, agentDir, bin, data: join(dir, "data"), log, repo };
+	writeGitnexusStub(workspace, options.gitnexus ?? {});
 	workspaces.push(workspace);
 	return workspace;
 }
 
 /**
- * The environment a pi process runs in: a temporary HOME and data folder, the test provider's
- * log, then `extra`. A test unsets XDG_DATA_HOME by passing it as undefined.
+ * Write the stub `gitnexus` a workspace puts first on PATH. It answers `list` and `cypher` in the
+ * real command's shape, so a test proves the Fixer reads an index without needing one on the Mac.
+ * A stub whose interpreter is absent fails to start, exactly as an uninstalled command does.
+ */
+function writeGitnexusStub(workspace: Workspace, options: GitnexusOptions): void {
+	const path = join(workspace.bin, "gitnexus");
+	if (options.missing === true) {
+		writeFileSync(path, "#!/nonexistent/gitnexus\n", { mode: 0o755 });
+		return;
+	}
+	const config = {
+		listedRepo: options.indexesRepo === true ? workspace.repo.path : `${workspace.dir}-not-indexed`,
+		symbols: options.symbols ?? [],
+		fails: options.fails === true,
+	};
+	const script = `#!${process.execPath}
+const config = ${JSON.stringify(config)};
+const command = process.argv[2];
+if (command === "list") {
+	process.stdout.write([
+		"",
+		"  GitNexus List (1.6.12)",
+		"",
+		"  Indexed Repositories (1)",
+		"",
+		"  pi-prompterize-test",
+		"    Path:    " + config.listedRepo,
+		"    Indexed: 2026-11-18, 5:24:38 PM",
+		"    Commit:  abc1234",
+		"",
+	].join("\\n") + "\\n");
+	process.exit(0);
+}
+if (command === "cypher") {
+	const markdown = ["| name |", "| --- |", ...config.symbols.map((name) => "| " + name + " |")].join("\\n");
+	const result = { markdown, row_count: config.symbols.length };
+	process.stdout.write("  GitNexus Cypher (1.6.12)\\n" + JSON.stringify(result, null, 2) + "\\n");
+	// A failed query may still have printed rows: the exit code, not the output, says it failed.
+	process.exit(config.fails ? 1 : 0);
+}
+process.stderr.write("unknown command " + command + "\\n");
+process.exit(1);
+`;
+	writeFileSync(path, script, { mode: 0o755 });
+}
+
+/**
+ * The environment a pi process runs in: a temporary HOME and data folder, the workspace's stub
+ * `gitnexus` first on PATH so no test reaches the Mac's own index, the test provider's log, then
+ * `extra`. A test unsets XDG_DATA_HOME by passing it as undefined.
  */
 const piEnv = (
 	workspace: Workspace,
@@ -136,6 +212,7 @@ const piEnv = (
 	HOME: workspace.home,
 	XDG_DATA_HOME: workspace.data,
 	PI_CODING_AGENT_DIR: workspace.agentDir,
+	PATH: `${workspace.bin}${delimiter}${process.env.PATH ?? ""}`,
 	PI_SKIP_VERSION_CHECK: "1",
 	PI_OFFLINE: "1",
 	PI_TELEMETRY: "0",
@@ -846,6 +923,173 @@ test("the Fixer's instructions tell its model to map a confidently meant word to
 	assert.match(system, /keep the word exactly as typed/i, "an unconfident word stays as typed");
 	assert.match(system, /possibly/i, "the hint uses the word possibly");
 	assert.match(system, /never "likely"/i, "the instructions forbid likely");
+});
+
+/**
+ * The GitNexus tests: the same pi session seam, with a stub `gitnexus` first on PATH at the edge
+ * of the Fixer's second real-name source. A test proves what the Fixer's model was offered and
+ * what the main model received; it never reads how the lookup is built.
+ */
+
+test("an indexed repo offers a symbol typed without its capitals or underscores to the Fixer's model, and the real symbol reaches the main model", () => {
+	const workspace = makeWorkspace({ gitnexus: { indexesRepo: true, symbols: ["getUserById"] } });
+	const typed = "pleas fix the getuserbyid call";
+	const fixed = "Please fix the getUserById call";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [{ from: "getuserbyid", to: "getUserById" }] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(
+		linesBeside(fixer[0].system, "getuserbyid", "getUserById").length,
+		1,
+		"the GitNexus index's symbol was offered beside the word typed without its capitals or underscores",
+	);
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1, "the prompt reached the main model once");
+	assert.equal(main[0].messages.at(-1), fixed, "the main model received the real symbol");
+});
+
+test("a half-remembered long symbol with several close matches in the index reaches the main model unchanged, followed by a possibly hint naming them", () => {
+	const symbols = ["loadPromptCatalogFromDisk", "loadPromptCatalogFromDir", "loadPromptCatalogFromUrl"];
+	const workspace = makeWorkspace({ gitnexus: { indexesRepo: true, symbols } });
+	const typed = "check the loadpromptcatalogfrom path";
+	const hinted =
+		"check the loadpromptcatalogfrom (possibly loadPromptCatalogFromDir or loadPromptCatalogFromUrl or loadPromptCatalogFromDisk) path";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({
+			text: hinted,
+			changes: [
+				{
+					word: "loadpromptcatalogfrom",
+					possibly: ["loadPromptCatalogFromDir", "loadPromptCatalogFromUrl", "loadPromptCatalogFromDisk"],
+				},
+			],
+		}),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	for (const name of symbols) {
+		assert.equal(
+			linesBeside(fixer[0].system, "loadpromptcatalogfrom", name).length,
+			1,
+			`the Fixer's model saw ${name} beside the half-remembered word`,
+		);
+	}
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1, "the prompt reached the main model once");
+	assert.equal(main[0].messages.at(-1), hinted, "the word stays as typed, followed by the possibly hint");
+	assert.match(
+		main[0].messages.at(-1) ?? "",
+		/\(possibly loadPromptCatalogFromDir or loadPromptCatalogFromUrl or loadPromptCatalogFromDisk\)/,
+		"the hint uses the word possibly and names the close matches",
+	);
+	assert.doesNotMatch(main[0].messages.at(-1) ?? "", /likely/i, "the hint never says likely");
+});
+
+test("a repo gitnexus does not list as indexed falls back to git's tracked files alone", () => {
+	const workspace = makeWorkspace({
+		files: ["src/auth-session.ts"],
+		gitnexus: { indexesRepo: false, symbols: ["getUserById"] },
+	});
+	const typed = "fix authsesion and getuserbyid";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: typed, changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(
+		linesBeside(fixer[0].system, "authsesion", "src/auth-session.ts").length,
+		1,
+		"git's tracked path is still offered",
+	);
+	assert.equal(fixer[0].system.includes("getUserById"), false, "the repo the command does not list offers no symbol");
+});
+
+test("a failing gitnexus falls back to git's tracked files, and the fixed prompt still reaches the main model", () => {
+	const workspace = makeWorkspace({
+		files: ["src/auth-session.ts"],
+		gitnexus: { indexesRepo: true, symbols: ["getUserById"], fails: true },
+	});
+	const fixed = "Please fix the auth-session.ts and getUserById check";
+	const run = runPi(workspace, "pleas fix the authsesion and getuserbyid check", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({
+			text: fixed,
+			changes: [
+				{ from: "authsesion", to: "auth-session.ts" },
+				{ from: "getuserbyid", to: "getUserById" },
+			],
+		}),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(
+		linesBeside(fixer[0].system, "authsesion", "src/auth-session.ts").length,
+		1,
+		"git's tracked path is still offered",
+	);
+	assert.equal(
+		linesBeside(fixer[0].system, "getuserbyid", "getUserById").length,
+		0,
+		"a query that failed offers none of the rows it printed",
+	);
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt still reached the main model");
+});
+
+test("a gitnexus command that cannot be run at all falls back to git's tracked files, and the fixed prompt still reaches the main model", () => {
+	const workspace = makeWorkspace({
+		files: ["src/auth-session.ts"],
+		gitnexus: { missing: true },
+	});
+	const fixed = "Please fix the auth-session.ts check";
+	const run = runPi(workspace, "pleas fix the authsesion check", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [{ from: "authsesion", to: "auth-session.ts" }] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(
+		linesBeside(fixer[0].system, "authsesion", "src/auth-session.ts").length,
+		1,
+		"git's tracked path is still offered",
+	);
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt still reached the main model");
+});
+
+test("in an indexed repo, symbols from the index and paths from git are matched together", () => {
+	const workspace = makeWorkspace({
+		files: ["src/auth-session.ts"],
+		gitnexus: { indexesRepo: true, symbols: ["getUserById"] },
+	});
+	const typed = "fix authsesion in the getuserbyid call";
+	const fixed = "fix auth-session.ts in the getUserById call";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX_SUBSTITUTIONS: JSON.stringify([
+			{ from: "authsesion", to: "auth-session.ts" },
+			{ from: "getuserbyid", to: "getUserById" },
+		]),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(
+		linesBeside(fixer[0].system, "authsesion", "src/auth-session.ts").length,
+		1,
+		"the tracked path is offered for the word close to it",
+	);
+	assert.equal(
+		linesBeside(fixer[0].system, "getuserbyid", "getUserById").length,
+		1,
+		"the indexed symbol is offered for the word close to it, in the same request",
+	);
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.at(-1)?.messages.at(-1), fixed, "both real names reached the main model");
 });
 
 /**

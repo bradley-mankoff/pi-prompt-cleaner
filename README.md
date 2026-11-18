@@ -36,22 +36,27 @@ cleared however the call ends.
 
 ### Real names
 
-Before the Fixer's model call, real-name lookup reads git's tracked file list in the repo the
-prompt was typed in. For each word in the prompt that looks like a path or symbol, it finds at
-most five real names close to it. The match ignores case, underscores, hyphens and dots, and
-allows a few wrong, missing or extra letters, so `authsession`, `auth_sesion` and
-`src/auth-sesion.ts` all find `src/auth-session.ts`.
+Before the Fixer's model call, real-name lookup reads two sources. Git's tracked file list answers
+in every repo. When the `gitnexus` command lists the current repo as indexed, the symbols from
+that index are offered alongside the paths, so a symbol typed without its underscores or capitals,
+such as `getuserbyid`, can find `getUserById`.
+
+For each word in the prompt that looks like a path or symbol, it finds at most five real names
+close to it. The match ignores case, underscores, hyphens and dots, and allows a few wrong,
+missing or extra letters, so `authsession`, `auth_sesion` and `src/auth-sesion.ts` all find
+`src/auth-session.ts`.
 
 Only those close matches go to the Fixer's model, each beside the word it is close to: never the
-repo's whole file list, and never the conversation. The Fixer's model maps a word to the real
-name when it is clearly the one meant. When no real name is a confident match, it keeps the word
-as typed and adds a **possibly hint** after it, such as
+repo's whole file list or symbol list, and never the conversation. The Fixer's model maps a word
+to the real name when it is clearly the one meant. When no real name is a confident match, it
+keeps the word as typed and adds a **possibly hint** after it, such as
 `(possibly src/auth-session.ts or src/auth-sessions.ts)`. The hint always says "possibly" and
 never "likely", so the main agent does its own analysis instead of trusting a guess.
 
 Every fix and every possibly hint, with its close matches, is listed in the Fixer's reply and
-lands in the Correction log. Real-name lookup lives in `extensions/real-names.ts`; a later version
-adds symbols from the repo's GitNexus index on top of git's file list.
+lands in the Correction log. Real-name lookup lives in `extensions/real-names.ts`; a repo with no
+index, a missing `gitnexus`, or a failing one falls back to git's files alone, so no failure holds
+up a prompt.
 
 ### Protected spans
 
