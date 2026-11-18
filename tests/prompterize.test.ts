@@ -13,12 +13,15 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const extension = join(root, "extensions", "prompterize.ts");
 const testProvider = join(root, "tests", "fixtures", "prompterize-test-provider.ts");
+
+/** The pi arguments both session modes share: no discovery, the extension, the test provider. */
+const SHARED_ARGS = ["--no-session", "-ne", "-e", extension, "-e", testProvider, "--model", "prompterize-test/main"];
 
 /** One request the test provider saw, as it wrote it to the log. */
 type Request = {
@@ -32,6 +35,13 @@ type Request = {
 /** One temporary Mac: a HOME, an agent folder, and the test provider's log. */
 type Workspace = { dir: string; home: string; agentDir: string; log: string };
 
+/** Every workspace this file made, removed once its tests are done. */
+const workspaces: Workspace[] = [];
+
+after(() => {
+	for (const workspace of workspaces) rmSync(workspace.dir, { recursive: true, force: true });
+});
+
 /** A workspace whose agent folder holds the settings a test wants pi to read. */
 function makeWorkspace(settings?: Record<string, unknown>): Workspace {
 	const dir = mkdtempSync(join(tmpdir(), "pi-prompterize-"));
@@ -40,66 +50,43 @@ function makeWorkspace(settings?: Record<string, unknown>): Workspace {
 	mkdirSync(home, { recursive: true });
 	mkdirSync(agentDir, { recursive: true });
 	if (settings !== undefined) writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
-	return { dir, home, agentDir, log: join(dir, "requests.jsonl") };
+	const workspace = { dir, home, agentDir, log: join(dir, "requests.jsonl") };
+	workspaces.push(workspace);
+	return workspace;
 }
+
+/** The environment a pi process runs in: a temporary HOME, the test provider's log, `extra`. */
+const piEnv = (workspace: Workspace, extra: Record<string, string>): Record<string, string | undefined> => ({
+	...process.env,
+	HOME: workspace.home,
+	PI_CODING_AGENT_DIR: workspace.agentDir,
+	PI_SKIP_VERSION_CHECK: "1",
+	PI_OFFLINE: "1",
+	PI_TELEMETRY: "0",
+	PROMPTERIZE_TEST_LOG: workspace.log,
+	...extra,
+});
 
 /** What one pi process printed and how it exited. */
 type PiOutput = { status: number | null; stdout: string; stderr: string };
 
 /** A pi session in print mode with the extension, the test provider and one typed prompt. */
 function runPi(workspace: Workspace, prompt: string, env: Record<string, string> = {}): PiOutput {
-	const result = spawnSync(
-		"pi",
-		[
-			"--no-session",
-			"-ne",
-			"-e",
-			extension,
-			"-e",
-			testProvider,
-			"--model",
-			"prompterize-test/main",
-			"-p",
-			prompt,
-		],
-		{
-			cwd: workspace.dir,
-			encoding: "utf8",
-			env: {
-				...process.env,
-				HOME: workspace.home,
-				PI_CODING_AGENT_DIR: workspace.agentDir,
-				PI_SKIP_VERSION_CHECK: "1",
-				PI_OFFLINE: "1",
-				PI_TELEMETRY: "0",
-				PROMPTERIZE_TEST_LOG: workspace.log,
-				...env,
-			},
-		},
-	);
+	const result = spawnSync("pi", [...SHARED_ARGS, "-p", prompt], {
+		cwd: workspace.dir,
+		encoding: "utf8",
+		env: piEnv(workspace, env),
+	});
 	return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
 /** A pi session in RPC mode, given one prompt command and run until it settles. */
 async function runRpc(workspace: Workspace, prompt: string, env: Record<string, string> = {}): Promise<PiOutput> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(
-			"pi",
-			["--mode", "rpc", "--no-session", "-ne", "-e", extension, "-e", testProvider, "--model", "prompterize-test/main"],
-			{
-				cwd: workspace.dir,
-				env: {
-					...process.env,
-					HOME: workspace.home,
-					PI_CODING_AGENT_DIR: workspace.agentDir,
-					PI_SKIP_VERSION_CHECK: "1",
-					PI_OFFLINE: "1",
-					PI_TELEMETRY: "0",
-					PROMPTERIZE_TEST_LOG: workspace.log,
-					...env,
-				},
-			},
-		);
+		const child = spawn("pi", ["--mode", "rpc", ...SHARED_ARGS], {
+			cwd: workspace.dir,
+			env: piEnv(workspace, env),
+		});
 		let stdout = "";
 		let stderr = "";
 		let buffer = "";
@@ -163,184 +150,140 @@ const reached = (workspace: Workspace, provider: string): Request[] =>
 
 test("a typed prompt with typos reaches the main model as the Fixer's fixed text, with no note of what changed", () => {
 	const workspace = makeWorkspace();
-	try {
-		const typed = "pleas fix teh bug in teh parser";
-		const fixed = "Please fix the bug in the parser.";
-		const run = runPi(workspace, typed, {
-			PROMPTERIZE_TEST_FIX: JSON.stringify({
-				text: fixed,
-				changes: [
-					{ from: "pleas", to: "Please" },
-					{ from: "teh", to: "the" },
-				],
-			}),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		const fixer = reached(workspace, "opencode-go");
-		assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
-		assert.equal(fixer[0].messages.at(-1), typed, "the Fixer saw the words the Boss typed");
-		const main = reached(workspace, "prompterize-test");
-		assert.equal(main.length, 1, "the prompt reached the main model once");
-		assert.equal(main[0].messages.at(-1), fixed, "the main model received the fixed text and nothing else");
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const typed = "pleas fix teh bug in teh parser";
+	const fixed = "Please fix the bug in the parser.";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({
+			text: fixed,
+			changes: [
+				{ from: "pleas", to: "Please" },
+				{ from: "teh", to: "the" },
+			],
+		}),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(fixer[0].messages.at(-1), typed, "the Fixer saw the words the Boss typed");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1, "the prompt reached the main model once");
+	assert.equal(main[0].messages.at(-1), fixed, "the main model received the fixed text and nothing else");
 });
 
 test("a typed prompt starting with * reaches the main model with the * stripped and no Fixer call", () => {
 	const workspace = makeWorkspace();
-	try {
-		const typed = "*pleas fix teh bug in teh parser";
-		const run = runPi(workspace, typed, {
-			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
-		const main = reached(workspace, "prompterize-test");
-		assert.equal(main.length, 1);
-		assert.equal(main[0].messages.at(-1), typed.slice(1), "the main model received the prompt without its *");
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const typed = "*pleas fix teh bug in teh parser";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1);
+	assert.equal(main[0].messages.at(-1), typed.slice(1), "the main model received the prompt without its *");
 });
 
 test("a slash command reaches pi untouched and is not sent to the Fixer", () => {
 	const workspace = makeWorkspace();
-	try {
-		const typed = "/model opencode-go/deepseek-v4.1-flash";
-		const run = runPi(workspace, typed, {
-			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "fixed", changes: [] }),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
-		const main = reached(workspace, "prompterize-test");
-		assert.equal(main.length, 1);
-		assert.equal(main[0].messages.at(-1), typed, "the main model received the command exactly as typed");
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const typed = "/model opencode-go/deepseek-v4.1-flash";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "fixed", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1);
+	assert.equal(main[0].messages.at(-1), typed, "the main model received the command exactly as typed");
 });
 
 test("a prompt from RPC is not sent to the Fixer", async () => {
 	const workspace = makeWorkspace();
-	try {
-		const typed = "pleas fix teh bug from rpc";
-		const run = await runRpc(workspace, typed, {
-			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug from RPC.", changes: [] }),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
-		const main = reached(workspace, "prompterize-test");
-		assert.equal(main.length, 1);
-		assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt exactly as RPC sent it");
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const typed = "pleas fix teh bug from rpc";
+	const run = await runRpc(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug from RPC.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1);
+	assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt exactly as RPC sent it");
 });
 
 test("a prompt sent by another extension is not sent to the Fixer", async () => {
 	const workspace = makeWorkspace();
-	try {
-		const typed = "pleas fix teh bug from an extension";
-		const run = await runRpc(workspace, "/prompterize-test-extension", {
-			PROMPTERIZE_TEST_EXTENSION_TEXT: typed,
-			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug from an extension.", changes: [] }),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
-		const main = reached(workspace, "prompterize-test");
-		assert.equal(main.length, 1);
-		assert.equal(main[0].messages.at(-1), typed, "the main model received the extension's prompt unchanged");
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const typed = "pleas fix teh bug from an extension";
+	const run = await runRpc(workspace, "/prompterize-test-extension", {
+		PROMPTERIZE_TEST_EXTENSION_TEXT: typed,
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug from an extension.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1);
+	assert.equal(main[0].messages.at(-1), typed, "the main model received the extension's prompt unchanged");
 });
 
 test("when the Fixer's model call fails, the prompt reaches the main model unchanged", () => {
 	const workspace = makeWorkspace();
-	try {
-		const typed = "pleas fix teh bug in teh parser";
-		const run = runPi(workspace, typed, { PROMPTERIZE_TEST_FIX_FAILURE: "the Fixer's model is down" });
-		assert.equal(run.status, 0, run.stderr);
-		assert.equal(reached(workspace, "opencode-go").length, 1, "the Fixer tried its model");
-		const main = reached(workspace, "prompterize-test");
-		assert.equal(main.length, 1);
-		assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt unchanged");
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const typed = "pleas fix teh bug in teh parser";
+	const run = runPi(workspace, typed, { PROMPTERIZE_TEST_FIX_FAILURE: "the Fixer's model is down" });
+	assert.equal(run.status, 0, run.stderr);
+	assert.equal(reached(workspace, "opencode-go").length, 1, "the Fixer tried its model");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1);
+	assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt unchanged");
 });
 
 test("the Fixer uses opencode-go/deepseek-v4.1-flash at low thinking by default", () => {
 	const workspace = makeWorkspace();
-	try {
-		const fixed = "Please fix the bug in the parser.";
-		const run = runPi(workspace, "pleas fix teh bug in teh parser", {
-			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [] }),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		const fixer = reached(workspace, "opencode-go");
-		assert.equal(fixer.length, 1);
-		assert.equal(fixer[0].model, "deepseek-v4.1-flash", "the default Fixer model");
-		assert.equal(fixer[0].reasoning, "low", "the default thinking level");
-		assert.equal(reached(workspace, "prompterize-test")[0].messages.at(-1), fixed);
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1);
+	assert.equal(fixer[0].model, "deepseek-v4.1-flash", "the default Fixer model");
+	assert.equal(fixer[0].reasoning, "low", "the default thinking level");
 });
 
 test("the Fixer's model and thinking level come from the prompterize settings", () => {
 	const settings = { prompterize: { fixer: { model: "opencode-go/flash", thinkingLevel: "high" } } };
 	const workspace = makeWorkspace(settings);
-	try {
-		const fixed = "Please fix the bug in the parser.";
-		const run = runPi(workspace, "pleas fix teh bug in teh parser", {
-			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [] }),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		const fixer = reached(workspace, "opencode-go");
-		assert.equal(fixer.length, 1);
-		assert.equal(fixer[0].model, "flash", "the model named in the settings");
-		assert.equal(fixer[0].reasoning, "high", "the thinking level named in the settings");
-		assert.equal(reached(workspace, "prompterize-test")[0].messages.at(-1), fixed);
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1);
+	assert.equal(fixer[0].model, "flash", "the model named in the settings");
+	assert.equal(fixer[0].reasoning, "high", "the thinking level named in the settings");
 });
 
 test("turning the Fixer off sends typed prompts to the main model unchanged", () => {
 	const settings = { prompterize: { fixer: { enabled: false } } };
 	const workspace = makeWorkspace(settings);
-	try {
-		const typed = "pleas fix teh bug in teh parser";
-		const run = runPi(workspace, typed, {
-			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
-		const main = reached(workspace, "prompterize-test");
-		assert.equal(main.length, 1);
-		assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt unchanged");
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const typed = "pleas fix teh bug in teh parser";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	assert.equal(reached(workspace, "opencode-go").length, 0, "the Fixer was not called");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1);
+	assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt unchanged");
 });
 
 test("the Fixer's instructions tell its model to fix typos and change nothing else", () => {
 	const workspace = makeWorkspace();
-	try {
-		const run = runPi(workspace, "pleas fix teh bug in teh parser", {
-			PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
-		});
-		assert.equal(run.status, 0, run.stderr);
-		const fixer = reached(workspace, "opencode-go");
-		assert.equal(fixer.length, 1);
-		assert.match(fixer[0].system, /fix.*typos/i);
-		assert.match(fixer[0].system, /change nothing else/i);
-		assert.match(fixer[0].system, /do not reword/i);
-		assert.match(fixer[0].system, /add content/i);
-		assert.equal(fixer[0].messages.at(-1), "pleas fix teh bug in teh parser", "the model saw the prompt as typed");
-	} finally {
-		rmSync(workspace.dir, { recursive: true, force: true });
-	}
+	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1);
+	assert.match(fixer[0].system, /fix.*typos/i);
+	assert.match(fixer[0].system, /change nothing else/i);
+	assert.match(fixer[0].system, /do not reword/i);
+	assert.match(fixer[0].system, /add content/i);
+	assert.equal(fixer[0].messages.at(-1), "pleas fix teh bug in teh parser", "the model saw the prompt as typed");
 });

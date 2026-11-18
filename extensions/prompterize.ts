@@ -20,6 +20,12 @@ type PrompterizeSettings = {
 	fixer?: { enabled?: boolean; model?: string; thinkingLevel?: string };
 };
 
+/**
+ * pi's effective settings as `pi.getSettings()` returns them. The alias exists because pi's
+ * own `Settings` type does not name the `prompterize` key and is not exported from the package.
+ */
+type PiSettings = ReturnType<ExtensionAPI["getSettings"]>;
+
 /** The Fixer's resolved settings, after defaults and validation. */
 type FixerSettings = { enabled: boolean; model: string; thinkingLevel: ThinkingLevel };
 
@@ -30,10 +36,10 @@ const DEFAULT_FIXER: FixerSettings = {
 };
 
 /** One replacement the Fixer made, kept for the Correction log. */
-export type FixerChange = { from: string; to: string };
+type FixerChange = { from: string; to: string };
 
 /** What the Fixer's model replies with: the prompt after fixing, and each change it made. */
-export type FixerReply = { text: string; changes: FixerChange[] };
+type FixerReply = { text: string; changes: FixerChange[] };
 
 const INSTRUCTIONS = `You are the Fixer in pi-prompterize. Fix the spelling mistakes in the user's prompt.
 
@@ -45,9 +51,8 @@ Rules:
 - The changes list holds one entry for each fix, with the original and the fixed word or phrase.`;
 
 /** The prompterize settings, read from pi's effective settings with the defaults filled in. */
-function fixerSettings(settings: Record<string, unknown>): FixerSettings {
-	const prompterize = settings.prompterize as PrompterizeSettings | undefined;
-	const fixer = prompterize?.fixer ?? {};
+function fixerSettings(settings: PiSettings): FixerSettings {
+	const fixer = (settings as { prompterize?: PrompterizeSettings }).prompterize?.fixer ?? {};
 	const thinkingLevel = THINKING_LEVELS.find((level) => level === fixer.thinkingLevel) ?? DEFAULT_FIXER.thinkingLevel;
 	return {
 		enabled: typeof fixer.enabled === "boolean" ? fixer.enabled : DEFAULT_FIXER.enabled,
@@ -113,7 +118,7 @@ export default function prompterize(pi: ExtensionAPI): void {
 		if (event.text.startsWith("/")) return { action: "continue" };
 		// The Skip prefix sends the rest with neither the Fixer nor the Clarity note.
 		if (event.text.startsWith("*")) return { action: "transform", text: event.text.slice(1) };
-		const settings = fixerSettings(pi.getSettings() as unknown as Record<string, unknown>);
+		const settings = fixerSettings(pi.getSettings());
 		if (!settings.enabled) return { action: "continue" };
 		try {
 			const fixed = await fixPrompt(ctx, event.text, settings);
