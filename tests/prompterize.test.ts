@@ -58,8 +58,11 @@ type Repo = { path: string; remote: string; commit: string };
  */
 type Workspace = { dir: string; home: string; agentDir: string; data: string; log: string; repo: Repo };
 
-/** What a test sets up before pi runs: the settings pi reads, and the repo's remote (null for none). */
-type WorkspaceOptions = { settings?: Record<string, unknown>; remote?: string | null };
+/**
+ * What a test sets up before pi runs: the settings pi reads, the repo's remote (null for none), and
+ * the files git tracks besides README.md, which are the real names the Fixer may offer.
+ */
+type WorkspaceOptions = { settings?: Record<string, unknown>; remote?: string | null; files?: string[] };
 
 /** The remote a temporary repo has unless its test says otherwise. */
 const TEST_REMOTE = "https://example.com/boss/pi-prompterize-test.git";
@@ -91,10 +94,15 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 	writeFileSync(log, "");
 	if (options.settings !== undefined) writeFileSync(join(agentDir, "settings.json"), JSON.stringify(options.settings));
 	writeFileSync(join(dir, "README.md"), "# a temporary repo\n");
+	const tracked = ["README.md", ...(options.files ?? [])];
+	for (const file of tracked.slice(1)) {
+		mkdirSync(dirname(join(dir, file)), { recursive: true });
+		writeFileSync(join(dir, file), "// a real file in the temporary repo\n");
+	}
 	git(dir, ["init", "--quiet", "--initial-branch=main"]);
 	const remote = options.remote === undefined ? TEST_REMOTE : options.remote;
 	if (remote !== null) git(dir, ["remote", "add", "origin", remote]);
-	git(dir, ["add", "README.md"]);
+	git(dir, ["add", ...tracked]);
 	git(dir, [
 		"-c",
 		"user.name=prompterize test",
@@ -236,7 +244,7 @@ type FixerRecord = {
 	outcome: string;
 	original: string;
 	fixed: string;
-	changes: { from: string; to: string }[];
+	changes: ({ from: string; to: string } | { word: string; possibly: string[] })[];
 	error?: string;
 };
 
@@ -677,6 +685,144 @@ for (const { mutation, verb } of placeholderMishandlings) {
 		assert.match(records[0].error ?? "", /placeholder/i, "the record says a placeholder was mishandled");
 	});
 }
+
+/**
+ * The real-name tests: the same pi session seam, in a repo whose tracked files are the real names
+ * the Fixer may offer its model. A test reads what the Fixer's model was sent and what the main
+ * model received, never how the lookup is built.
+ */
+
+/** The lines of a Fixer request's system prompt that carry `word` beside `name`, so a test can see the pair without fixing the section's format. */
+const linesBeside = (system: string, word: string, name: string): string[] =>
+	system.split("\n").filter((line) => line.includes(word) && line.includes(name));
+
+test("matching real names ignores case, underscores, hyphens and dots and tolerates small spelling errors", () => {
+	const workspace = makeWorkspace({ files: ["src/auth-session.ts"] });
+	const typed = "fix authsession, Auth.Session, auth_sesion and src/auth-sesion.ts please";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: typed, changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	// Each word is close to src/auth-session.ts once case and separators are ignored and one letter
+	// is allowed to be wrong: authsession has no separators at all, Auth.Session carries a dot and
+	// capitals, auth_sesion an underscore and a missing s, and src/auth-sesion.ts a missing s.
+	for (const word of ["authsession", "Auth.Session", "auth_sesion", "src/auth-sesion.ts"]) {
+		assert.equal(
+			linesBeside(fixer[0].system, word, "src/auth-session.ts").length,
+			1,
+			`the Fixer's model saw ${word} beside the real name src/auth-session.ts`,
+		);
+	}
+});
+
+test("the Fixer's model request carries only the close real names, never the whole file list and never the conversation", () => {
+	const files = ["src/auth-session.ts", "src/unrelated-widget.ts", "docs/notes.md"];
+	const workspace = makeWorkspace({ files });
+	const typed = "fix the authsession check";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "fix the auth-session.ts check", changes: [{ from: "authsession", to: "auth-session.ts" }] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(linesBeside(fixer[0].system, "authsession", "src/auth-session.ts").length, 1, "the close real name is given to the Fixer's model");
+	for (const name of ["README.md", ...files]) {
+		if (name === "src/auth-session.ts") continue;
+		assert.equal(fixer[0].system.includes(name), false, `a real name no typed word is close to stays out of the request: ${name}`);
+	}
+	assert.deepEqual(fixer[0].messages, [typed], "the request carries the typed prompt and no conversation");
+});
+
+test("a misspelled file path in a typed prompt reaches the main model as the real tracked path", () => {
+	const workspace = makeWorkspace({ files: ["src/auth-session.ts", "src/parser.ts"] });
+	const typed = "pleas fix the bug in src/auth-sesion.ts";
+	const fixed = "Please fix the bug in src/auth-session.ts";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({
+			text: fixed,
+			changes: [
+				{ from: "pleas", to: "Please" },
+				{ from: "src/auth-sesion.ts", to: "src/auth-session.ts" },
+			],
+		}),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(
+		linesBeside(fixer[0].system, "src/auth-sesion.ts", "src/auth-session.ts").length,
+		1,
+		"the tracked path is given to the Fixer's model as the real name for the misspelled one",
+	);
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1, "the prompt reached the main model once");
+	assert.equal(main[0].messages.at(-1), fixed, "the main model received the real tracked path");
+});
+
+/** The two real names a word with no confident match is close to, as the test's Fixer model names them. */
+const closeAuthNames = ["src/auth-session.ts", "src/auth-sessions.ts"];
+
+test("a word with several close matches and no confident one reaches the main model unchanged and followed by a possibly hint", () => {
+	const workspace = makeWorkspace({ files: closeAuthNames });
+	const typed = "check the authsesion flow";
+	const hinted = "check the authsesion (possibly src/auth-session.ts or src/auth-sessions.ts) flow";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({
+			text: hinted,
+			changes: [{ word: "authsesion", possibly: closeAuthNames }],
+		}),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	for (const name of closeAuthNames) {
+		assert.equal(linesBeside(fixer[0].system, "authsesion", name).length, 1, `the Fixer's model saw ${name} beside the word it may be close to`);
+	}
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1, "the prompt reached the main model once");
+	assert.equal(main[0].messages.at(-1), hinted, "the word stays as typed, followed by the possibly hint");
+	assert.match(main[0].messages.at(-1) ?? "", /\(possibly src\/auth-session\.ts or src\/auth-sessions\.ts\)/, "the hint uses the word possibly and names the close matches");
+	assert.doesNotMatch(main[0].messages.at(-1) ?? "", /likely/i, "the hint never says likely");
+});
+
+test("each change and each possibly hint, with its matches, appears in the Fixer record's list of changes", () => {
+	const workspace = makeWorkspace({ files: closeAuthNames });
+	const typed = "pleas check the authsesion flow";
+	const changes = [
+		{ from: "pleas", to: "Please" },
+		{ word: "authsesion", possibly: closeAuthNames },
+	];
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({
+			text: "Please check the authsesion (possibly src/auth-session.ts or src/auth-sessions.ts) flow",
+			changes,
+		}),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const records = correctionRecords(correctionLog(workspace));
+	assert.equal(records.length, 1, "the run wrote one Fixer record");
+	assert.equal(records[0].outcome, "fixed");
+	assert.deepEqual(records[0].changes, changes, "the record holds the typo fix and the possibly hint with its matches");
+});
+
+test("the Fixer's instructions tell its model to map a confidently meant word to its real name and otherwise to use a possibly hint, never likely", () => {
+	const workspace = makeWorkspace({ files: ["src/auth-session.ts"] });
+	const typed = "check the authsession flow";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: typed, changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	const system = fixer[0].system;
+	assert.match(system, /replace the word with that real name/i, "a confident match is mapped to the real name");
+	assert.match(system, /no given real name is a confident match/i, "the model decides confidence, and the instructions name it");
+	assert.match(system, /keep the word exactly as typed/i, "an unconfident word stays as typed");
+	assert.match(system, /possibly/i, "the hint uses the word possibly");
+	assert.match(system, /never "likely"/i, "the instructions forbid likely");
+});
 
 /**
  * The tests above drive pi as a `pi -p` subprocess. The status line and Esc need the interactive

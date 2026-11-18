@@ -1,7 +1,8 @@
 /**
  * pi-prompterize: the Fixer sends each typed prompt to a cheap, fast model that fixes its
- * typos before the main agent reads it. The Boss's words are the only thing that changes;
- * nothing is added to the prompt to say what changed.
+ * typos and maps near-miss file names to the repo's real names before the main agent reads it.
+ * The Boss's words are the only thing that changes; nothing is added to the prompt to say what
+ * changed.
  *
  * A typed prompt that was not skipped also gets the Clarity note in its run's system prompt,
  * so the main agent knows to act at once on a clear prompt and to ask one Question round
@@ -32,6 +33,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
+import { closeRealNames, type RealNameMatch } from "./real-names.ts";
 
 /** The thinking levels pi offers, as the prompterize settings accept them. */
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -97,8 +99,11 @@ const CLARITY_NOTE = `Clarity note: before acting, judge whether this prompt is 
 
 Do not add or call a tool for this; ask the questions in your reply.`;
 
-/** One replacement the Fixer made, kept for the Correction log. */
-type FixerChange = { from: string; to: string };
+/**
+ * One entry in the Fixer's changes list: a typo it fixed, or a word it left as typed with a
+ * possibly hint naming the real names close to it.
+ */
+type FixerChange = { from: string; to: string } | { word: string; possibly: string[] };
 
 /** What the Fixer's model replies with: the prompt after fixing, and each change it made. */
 type FixerReply = { text: string; changes: FixerChange[] };
@@ -140,9 +145,22 @@ Rules:
 - Fix typos and change nothing else. Do not reword, reorder, shorten, expand or add content.
 - Keep the user's meaning, language, punctuation, capitalisation and layout as they are apart from the typos.
 - Text in a placeholder such as ⟦prompterize:...⟧ was written or chosen by the user on purpose. Copy each placeholder exactly once, exactly as it is, and add no placeholder of your own.
+- Some real names from the repo may be listed below, each beside a word that is close to it. When one of them is clearly the name the user meant, replace the word with that real name.
+- When no given real name is a confident match for a word, keep the word exactly as typed and add a possibly hint right after it, naming the close real names: "(possibly A or B)". Use the word "possibly" and never "likely".
 - Reply with JSON only, with no code fence and no explanation, in exactly this shape:
-{"text":"<the prompt with its typos fixed>","changes":[{"from":"<the text as typed>","to":"<the text after fixing>"}]}
-- The changes list holds one entry for each fix, with the original and the fixed word or phrase.`;
+{"text":"<the prompt with its typos fixed>","changes":[{"from":"<the text as typed>","to":"<the text after fixing>"},{"word":"<the word as typed>","possibly":["<real name>"]}]}
+- The changes list holds one entry for each fix, with the original and the fixed word or phrase. A possibly hint gets its own entry, with the word as typed and the real names close to it.`;
+
+/**
+ * The real names the Fixer's model is given, each beside the typed word it is close to, or nothing
+ * when no word found a close name. Only these close matches go to the model: never the repo's
+ * whole file list, and never the conversation.
+ */
+function realNameSection(matches: RealNameMatch[]): string {
+	if (matches.length === 0) return "";
+	const lines = matches.map(({ word, names }) => `- ${word}: ${names.join(", ")}`);
+	return `Real names from this repo that are close to words in the prompt (git's tracked files). A word may be a misspelling of one of its names:\n${lines.join("\n")}`;
+}
 
 /** The prompterize settings pi holds, before any default is filled in. */
 function prompterizeSettings(settings: PiSettings): PrompterizeSettings {
@@ -184,13 +202,18 @@ function parseReply(raw: string): FixerReply {
 	const { text: fixed, changes } = parsed as { text?: unknown; changes?: unknown };
 	if (typeof fixed !== "string") throw new Error("the Fixer's reply has no text");
 	if (!Array.isArray(changes)) throw new Error("the Fixer's reply has no changes list");
-	const checked = changes.map((change) => {
-		if (typeof change !== "object" || change === null) throw new Error("a change is not an object");
-		const { from, to } = change as { from?: unknown; to?: unknown };
-		if (typeof from !== "string" || typeof to !== "string") throw new Error("a change has no from/to pair");
-		return { from, to };
-	});
-	return { text: fixed, changes: checked };
+	return { text: fixed, changes: changes.map(parseChange) };
+}
+
+/** One entry of the Fixer's changes list: a typo fix, or a word left as typed with a possibly hint. */
+function parseChange(change: unknown): FixerChange {
+	if (typeof change !== "object" || change === null) throw new Error("a change is not an object");
+	const { from, to, word, possibly } = change as { from?: unknown; to?: unknown; word?: unknown; possibly?: unknown };
+	if (typeof from === "string" && typeof to === "string") return { from, to };
+	if (typeof word === "string" && Array.isArray(possibly) && possibly.every((name) => typeof name === "string")) {
+		return { word, possibly };
+	}
+	throw new Error("a change is neither a from/to pair nor a possibly hint");
 }
 
 /** Half-open `[start, stop)`: where a line or a span starts, and where it ends. */
@@ -442,7 +465,7 @@ function unlessAborted<T>(reply: Promise<T>, signal: AbortSignal): Promise<T | u
  * result is total: a failure comes back as the error outcome, so the caller never has to catch
  * one.
  */
-async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerSettings): Promise<FixerRun> {
+async function fixPrompt(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string, settings: FixerSettings): Promise<FixerRun> {
 	const started = Date.now();
 	const controller = new AbortController();
 	// Esc during the wait cancels the call, so the Boss is never stuck behind a slow or hung model.
@@ -457,8 +480,9 @@ async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerS
 		const model: Model<Api> | undefined = ctx.modelRegistry.find(provider, id);
 		if (!model) throw new Error(`the Fixer's model ${settings.model} is not available`);
 		const protectedPrompt = protectSpans(prompt);
+		const realNames = await closeRealNames(pi, ctx.cwd, protectedPrompt.text);
 		const context: Context = {
-			systemPrompt: INSTRUCTIONS,
+			systemPrompt: [INSTRUCTIONS, realNameSection(realNames)].filter((section) => section.length > 0).join("\n\n"),
 			messages: [{ role: "user", content: [{ type: "text", text: protectedPrompt.text }], timestamp: started }],
 		};
 		const reply = await unlessAborted(
@@ -475,10 +499,17 @@ async function fixPrompt(ctx: ExtensionContext, prompt: string, settings: FixerS
 		return runEnded(started, {
 			outcome: fixed === prompt ? "unchanged" : "fixed",
 			fixed,
-			changes: parsed.changes.map((change) => ({
-				from: restoreSpans(change.from, protectedPrompt.spans),
-				to: restoreSpans(change.to, protectedPrompt.spans),
-			})),
+			changes: parsed.changes.map((change) =>
+				"from" in change
+					? {
+							from: restoreSpans(change.from, protectedPrompt.spans),
+							to: restoreSpans(change.to, protectedPrompt.spans),
+						}
+					: {
+							word: restoreSpans(change.word, protectedPrompt.spans),
+							possibly: change.possibly.map((name) => restoreSpans(name, protectedPrompt.spans)),
+						},
+			),
 		});
 	} catch (failure) {
 		// A provider that fails on the abort, rather than reporting it, still ends as cancelled.
@@ -581,7 +612,7 @@ export default function prompterize(pi: ExtensionAPI): void {
 		const settings = fixerSettings(piSettings);
 		let text = event.text;
 		if (settings.enabled) {
-			const run = await fixPrompt(ctx, event.text, settings);
+			const run = await fixPrompt(pi, ctx, event.text, settings);
 			await logFixerRun(pi, ctx, settings, event.text, run);
 			if (run.outcome === "fixed") text = run.fixed;
 		}
