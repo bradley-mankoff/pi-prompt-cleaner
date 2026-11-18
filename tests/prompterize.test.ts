@@ -266,6 +266,28 @@ test("a typed prompt with typos reaches the main model as the Fixer's fixed text
 	assert.equal(main[0].messages.at(-1), fixed, "the main model received the fixed text and nothing else");
 });
 
+test("a typed prompt carries the Clarity note, which tells the main agent when to act and when to ask", () => {
+	const workspace = makeWorkspace();
+	const run = runPi(workspace, "pleas fix teh parser", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the parser.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1);
+	const request = main[0].system;
+	assert.match(request, /clear enough to act on/i, "the note asks the agent to judge the prompt's clarity");
+	assert.match(request, /proceed at once/i, "a clear prompt is acted on at once");
+	assert.match(request, /context makes the intent plain/i, "context can make the intent plain");
+	assert.match(request, /look up what you can/i, "the agent looks things up for itself first");
+	assert.match(request, /one Question round/i, "an unclear prompt gets one Question round");
+	assert.match(request, /numbered/i, "the Question round is numbered, as the grilling skill formats it");
+	assert.match(request, /suggested answer/i, "each question carries a suggested answer");
+	assert.match(request, /"yes"/, "yes accepts the suggested answers");
+	assert.match(request, /wait/i, "the agent waits for the answer before working");
+	assert.match(request, /whole new feature or project/i, "a whole new feature or project is told apart");
+	assert.match(request, /grilling skill in full/i, "a whole new feature or project gets the full grilling skill");
+});
+
 test("a typed prompt starting with * reaches the main model with the * stripped and no Fixer call", () => {
 	const workspace = makeWorkspace();
 	const typed = "*pleas fix teh bug in teh parser";
@@ -277,6 +299,7 @@ test("a typed prompt starting with * reaches the main model with the * stripped 
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1);
 	assert.equal(main[0].messages.at(-1), typed.slice(1), "the main model received the prompt without its *");
+	assert.doesNotMatch(main[0].system, /Clarity note/i, "a skipped prompt carries no Clarity note");
 });
 
 test("a slash command reaches pi untouched and is not sent to the Fixer", () => {
@@ -290,6 +313,7 @@ test("a slash command reaches pi untouched and is not sent to the Fixer", () => 
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1);
 	assert.equal(main[0].messages.at(-1), typed, "the main model received the command exactly as typed");
+	assert.doesNotMatch(main[0].system, /Clarity note/i, "a slash command carries no Clarity note");
 });
 
 test("a prompt from RPC is not sent to the Fixer", async () => {
@@ -303,6 +327,7 @@ test("a prompt from RPC is not sent to the Fixer", async () => {
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1);
 	assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt exactly as RPC sent it");
+	assert.doesNotMatch(main[0].system, /Clarity note/i, "a prompt from RPC carries no Clarity note");
 });
 
 test("a prompt sent by another extension is not sent to the Fixer", async () => {
@@ -317,6 +342,7 @@ test("a prompt sent by another extension is not sent to the Fixer", async () => 
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1);
 	assert.equal(main[0].messages.at(-1), typed, "the main model received the extension's prompt unchanged");
+	assert.doesNotMatch(main[0].system, /Clarity note/i, "a prompt from another extension carries no Clarity note");
 });
 
 test("when the Fixer's model call fails, the prompt reaches the main model unchanged", () => {
@@ -367,6 +393,23 @@ test("turning the Fixer off sends typed prompts to the main model unchanged", ()
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1);
 	assert.equal(main[0].messages.at(-1), typed, "the main model received the prompt unchanged");
+	assert.match(main[0].system, /Clarity note/i, "the Clarity note is still on when the Fixer is off");
+});
+
+test("turning the Clarity note off leaves the Fixer fixing typed prompts", () => {
+	const settings = { prompterize: { clarity: { enabled: false } } };
+	const workspace = makeWorkspace({ settings });
+	const typed = "pleas fix teh bug in teh parser";
+	const fixed = "Please fix the bug in the parser.";
+	const run = runPi(workspace, typed, {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	assert.equal(reached(workspace, "opencode-go").length, 1, "the Fixer still ran");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.length, 1);
+	assert.equal(main[0].messages.at(-1), fixed, "the main model received the fixed text");
+	assert.doesNotMatch(main[0].system, /Clarity note/i, "the Clarity note was turned off");
 });
 
 test("the Fixer's instructions tell its model to fix typos and change nothing else", () => {
