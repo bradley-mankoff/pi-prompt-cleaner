@@ -65,22 +65,19 @@ type FixerRun = {
 	error?: string;
 };
 
-/** One Fixer run as the Correction log keeps it, for a later model studying the Boss's typing. */
-type FixerRecord = {
+/**
+ * One Fixer run as the Correction log keeps it: the run itself, plus where and with what it
+ * ran and the text it started from.
+ */
+type FixerRecord = FixerRun & {
 	id: string;
-	time: string;
 	sessionId: string;
 	repoPath: string;
 	remote: string;
 	commit: string;
 	model: string;
 	thinkingLevel: ThinkingLevel;
-	durationMs: number;
-	outcome: FixerOutcome;
 	original: string;
-	fixed: string;
-	changes: FixerChange[];
-	error?: string;
 };
 
 const INSTRUCTIONS = `You are the Fixer in pi-prompterize. Fix the spelling mistakes in the user's prompt.
@@ -182,11 +179,12 @@ type RepoFacts = { repoPath: string; remote: string; commit: string };
  * folder git does not know, or a repo with no remote, gives an empty field instead of a failure.
  */
 async function repoFacts(pi: ExtensionAPI, cwd: string): Promise<RepoFacts> {
-	const top = await pi.exec("git", ["rev-parse", "--show-toplevel", "HEAD"], { cwd });
-	if (top.code !== 0) return { repoPath: cwd, remote: "", commit: "" };
-	const [repoPath, commit = ""] = top.stdout.trim().split("\n");
-	const names = await pi.exec("git", ["remote"], { cwd });
-	const remoteName = names.stdout.split("\n").find((name) => name.trim().length > 0);
+	const pathAndCommit = await pi.exec("git", ["rev-parse", "--show-toplevel", "HEAD"], { cwd });
+	if (pathAndCommit.code !== 0) return { repoPath: cwd, remote: "", commit: "" };
+	// One call answers both questions, one line each: the repo's top level, then HEAD.
+	const [repoPath, commit = ""] = pathAndCommit.stdout.trim().split("\n");
+	const remoteNames = await pi.exec("git", ["remote"], { cwd });
+	const remoteName = remoteNames.stdout.split("\n").find((name) => name.trim().length > 0);
 	if (remoteName === undefined) return { repoPath, remote: "", commit };
 	const url = await pi.exec("git", ["remote", "get-url", remoteName.trim()], { cwd });
 	return { repoPath, remote: url.code === 0 ? url.stdout.trim() : "", commit };
@@ -194,7 +192,7 @@ async function repoFacts(pi: ExtensionAPI, cwd: string): Promise<RepoFacts> {
 
 /**
  * Append one Fixer record to the Correction log. The log is a study aid, so a log that cannot
- * be read, made or written is dropped: whatever the log does, the Boss's prompt still goes on.
+ * be made or written is dropped: whatever the log does, the Boss's prompt still goes on.
  */
 async function logFixerRun(
 	pi: ExtensionAPI,
@@ -207,19 +205,14 @@ async function logFixerRun(
 		const { repoPath, remote, commit } = await repoFacts(pi, ctx.cwd);
 		const record: FixerRecord = {
 			id: randomUUID(),
-			time: run.time,
 			sessionId: ctx.sessionManager.getSessionId(),
 			repoPath,
 			remote,
 			commit,
 			model: settings.model,
 			thinkingLevel: settings.thinkingLevel,
-			durationMs: run.durationMs,
-			outcome: run.outcome,
 			original,
-			fixed: run.fixed,
-			changes: run.changes,
-			...(run.error === undefined ? {} : { error: run.error }),
+			...run,
 		};
 		const path = correctionLogPath();
 		await mkdir(dirname(path), { recursive: true });

@@ -83,7 +83,7 @@ function record(requested: Model<Api>, context: Context, options?: SimpleStreamO
 	);
 }
 
-/** One reply, as pi's stream of events, sent now or after `delayMs`, or the failure when given. */
+/** One reply, as pi's stream of events, sent after `delayMs` (`0` sends it next tick), or the failure when given. */
 function replyOf(requested: Model<Api>, text: string, failure?: string, delayMs = 0): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	const reply = message(requested, text, failure);
@@ -98,8 +98,7 @@ function replyOf(requested: Model<Api>, text: string, failure?: string, delayMs 
 		stream.push({ type: "text_end", contentIndex: 0, content: text, partial: reply });
 		stream.push({ type: "done", reason: "stop", message: reply });
 	};
-	if (delayMs > 0) setTimeout(send, delayMs);
-	else queueMicrotask(send);
+	setTimeout(send, delayMs);
 	return stream;
 }
 

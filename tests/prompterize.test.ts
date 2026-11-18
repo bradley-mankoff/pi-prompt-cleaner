@@ -71,11 +71,11 @@ after(() => {
 	for (const workspace of workspaces) rmSync(workspace.dir, { recursive: true, force: true });
 });
 
-/** Run one git command in a test's repo and return its stdout, failing the test when git fails. */
-function git(cwd: string, args: string[]): { stdout: string } {
+/** Run one git command in a test's repo and return its trimmed stdout, failing the test when git fails. */
+function git(cwd: string, args: string[]): string {
 	const result = spawnSync("git", args, { cwd, encoding: "utf8" });
 	assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
-	return { stdout: result.stdout };
+	return result.stdout.trim();
 }
 
 /** A temporary Mac for one test: a HOME, an agent folder, a data folder, a git repo, and the test provider's log. */
@@ -102,9 +102,9 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 		"the code as it was when the prompt was typed",
 	]);
 	const repo = {
-		path: git(dir, ["rev-parse", "--show-toplevel"]).stdout.trim(),
+		path: git(dir, ["rev-parse", "--show-toplevel"]),
 		remote: remote ?? "",
-		commit: git(dir, ["rev-parse", "HEAD"]).stdout.trim(),
+		commit: git(dir, ["rev-parse", "HEAD"]),
 	};
 	const workspace = { dir, home, agentDir, data: join(dir, "data"), log: join(dir, "requests.jsonl"), repo };
 	workspaces.push(workspace);
@@ -115,7 +115,10 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
  * The environment a pi process runs in: a temporary HOME and data folder, the test provider's
  * log, then `extra`. A test unsets XDG_DATA_HOME by passing it as undefined.
  */
-const piEnv = (workspace: Workspace, extra: Record<string, string | undefined>): Record<string, string | undefined> => ({
+const piEnv = (
+	workspace: Workspace,
+	extra: Record<string, string | undefined>,
+): Record<string, string | undefined> => ({
 	...process.env,
 	HOME: workspace.home,
 	XDG_DATA_HOME: workspace.data,
@@ -234,7 +237,7 @@ type FixerRecord = {
 const correctionLog = (workspace: Workspace): string => join(workspace.data, "pi-prompterize", "corrections.jsonl");
 
 /** Every record in the Correction log at `path`, in the order it was written. */
-function corrections(path: string): FixerRecord[] {
+function correctionRecords(path: string): FixerRecord[] {
 	return readFileSync(path, "utf8")
 		.split("\n")
 		.filter(Boolean)
@@ -396,7 +399,7 @@ test("a fixed prompt appends one Fixer record to the Correction log under XDG_DA
 	});
 	const after = Date.now();
 	assert.equal(run.status, 0, run.stderr);
-	const records = corrections(correctionLog(workspace));
+	const records = correctionRecords(correctionLog(workspace));
 	assert.equal(records.length, 1, "the run wrote one line, one Fixer record");
 	const record = records[0];
 	assert.equal(record.outcome, "fixed");
@@ -409,7 +412,11 @@ test("a fixed prompt appends one Fixer record to the Correction log under XDG_DA
 	assert.equal(record.commit, workspace.repo.commit);
 	assert.equal(record.model, "opencode-go/deepseek-v4.1-flash");
 	assert.equal(record.thinkingLevel, "low");
-	assert.match(record.id, /\S/, "the record has an id");
+	assert.match(
+		record.id,
+		/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		"the record's id is a UUID",
+	);
 	assert.ok(record.durationMs >= 50, `the Fixer call took the 50ms the test provider delayed: ${record.durationMs}`);
 	assert.ok(
 		Date.parse(record.time) >= before && Date.parse(record.time) <= after,
@@ -425,7 +432,7 @@ test("a prompt the Fixer left as it was is logged with outcome unchanged", () =>
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: typed, changes: [] }),
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = corrections(correctionLog(workspace));
+	const records = correctionRecords(correctionLog(workspace));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].outcome, "unchanged");
 	assert.equal(records[0].fixed, typed, "the text the main model received is the text as typed");
@@ -441,7 +448,8 @@ test("each Fixer run appends its own line, so the log keeps every run in order",
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the reader.", changes: [] }),
 	});
 	assert.equal(second.status, 0, second.stderr);
-	const originals = corrections(correctionLog(workspace)).map((record) => record.original);
+	const records = correctionRecords(correctionLog(workspace));
+	const originals = records.map((record) => record.original);
 	assert.deepEqual(originals, ["pleas fix teh parser", "pleas fix teh reader"]);
 });
 
@@ -451,7 +459,7 @@ test("a failed Fixer call is logged with outcome error and the error's message",
 		PROMPTERIZE_TEST_FIX_FAILURE: "the Fixer's model is down",
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = corrections(correctionLog(workspace));
+	const records = correctionRecords(correctionLog(workspace));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].outcome, "error");
 	assert.equal(records[0].error, "the Fixer's model is down");
@@ -464,7 +472,7 @@ test("the Correction log falls back to ~/.local/share when XDG_DATA_HOME is unse
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = corrections(join(workspace.home, ".local", "share", "pi-prompterize", "corrections.jsonl"));
+	const records = correctionRecords(join(workspace.home, ".local", "share", "pi-prompterize", "corrections.jsonl"));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].outcome, "fixed");
 });
@@ -489,7 +497,7 @@ test("a repo with no git remote logs the remote as empty and lets the fixed prom
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [] }),
 	});
 	assert.equal(run.status, 0, run.stderr);
-	const records = corrections(correctionLog(workspace));
+	const records = correctionRecords(correctionLog(workspace));
 	assert.equal(records.length, 1);
 	assert.equal(records[0].remote, "");
 	assert.equal(records[0].commit, workspace.repo.commit, "the commit is still recorded");
