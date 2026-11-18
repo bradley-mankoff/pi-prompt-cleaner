@@ -1,0 +1,10 @@
+{
+  "name": "pi-prompterize",
+  "version": "0.1.0",
+  "description": "Prepares each typed pi prompt before the main agent reads it: fixes typing, then lets the agent ask when the prompt is unclear.",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./extensions"] },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "scripts": { "test": "node --experimental-strip-types --no-warnings --test tests/*.test.ts" }
+}
