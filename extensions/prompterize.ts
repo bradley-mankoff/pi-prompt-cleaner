@@ -49,11 +49,6 @@ const DEFAULT_FIXER: FixerSettings = {
 	thinkingLevel: "low",
 };
 
-/** Whether a run started by a typed prompt carries the Clarity note; on unless the settings say otherwise. */
-type ClaritySettings = { enabled: boolean };
-
-const DEFAULT_CLARITY: ClaritySettings = { enabled: true };
-
 /**
  * The Clarity note, adapted from severity1's claude-code-prompt-improver evaluation wrapper.
  *
@@ -138,9 +133,14 @@ Rules:
 {"text":"<the prompt with its typos fixed>","changes":[{"from":"<the text as typed>","to":"<the text after fixing>"}]}
 - The changes list holds one entry for each fix, with the original and the fixed word or phrase.`;
 
-/** The prompterize settings, read from pi's effective settings with the defaults filled in. */
+/** The prompterize settings pi holds, before any default is filled in. */
+function prompterizeSettings(settings: PiSettings): PrompterizeSettings {
+	return (settings as { prompterize?: PrompterizeSettings }).prompterize ?? {};
+}
+
+/** The Fixer's resolved settings, after defaults and validation. */
 function fixerSettings(settings: PiSettings): FixerSettings {
-	const fixer = (settings as { prompterize?: PrompterizeSettings }).prompterize?.fixer ?? {};
+	const fixer = prompterizeSettings(settings).fixer ?? {};
 	const thinkingLevel = THINKING_LEVELS.find((level) => level === fixer.thinkingLevel) ?? DEFAULT_FIXER.thinkingLevel;
 	return {
 		enabled: typeof fixer.enabled === "boolean" ? fixer.enabled : DEFAULT_FIXER.enabled,
@@ -149,10 +149,9 @@ function fixerSettings(settings: PiSettings): FixerSettings {
 	};
 }
 
-/** Whether runs started by a typed prompt carry the Clarity note, read from pi's settings. */
-function claritySettings(settings: PiSettings): ClaritySettings {
-	const clarity = (settings as { prompterize?: PrompterizeSettings }).prompterize?.clarity ?? {};
-	return { enabled: typeof clarity.enabled === "boolean" ? clarity.enabled : DEFAULT_CLARITY.enabled };
+/** Whether runs started by a typed prompt carry the Clarity note; on unless the settings say otherwise. */
+function clarityEnabled(settings: PiSettings): boolean {
+	return prompterizeSettings(settings).clarity?.enabled ?? true;
 }
 
 /** Split "provider/model" at its first slash, as pi names a model in settings. */
@@ -283,18 +282,18 @@ export default function prompterize(pi: ExtensionAPI): void {
 	 * The input handler sets it; `before_agent_start` consumes it, and matches it against the
 	 * run's prompt so a run started by another extension or RPC can never pick it up.
 	 */
-	let noteFor: string | null = null;
+	let promptForClarityNote: string | null = null;
 
 	pi.on("before_agent_start", (event) => {
-		const prompt = noteFor;
-		noteFor = null;
+		const prompt = promptForClarityNote;
+		promptForClarityNote = null;
 		if (event.messageType !== "user") return;
 		if (prompt === null || event.prompt !== prompt) return;
 		event.systemPromptOptions.sections.clarity_note = CLARITY_NOTE;
 	});
 
 	pi.on("input", async (event, ctx) => {
-		noteFor = null;
+		promptForClarityNote = null;
 		// Only the Boss's own typing is a typed prompt (GLOSSARY.md).
 		if (event.source !== "interactive") return { action: "continue" };
 		// Slash commands are pi's, not the Fixer's, and carry no Clarity note.
@@ -309,7 +308,7 @@ export default function prompterize(pi: ExtensionAPI): void {
 			await logFixerRun(pi, ctx, settings, event.text, run);
 			if (run.outcome === "fixed") text = run.fixed;
 		}
-		if (claritySettings(piSettings).enabled) noteFor = text;
+		if (clarityEnabled(piSettings)) promptForClarityNote = text;
 		return text === event.text ? { action: "continue" } : { action: "transform", text };
 	});
 }

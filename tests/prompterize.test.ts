@@ -273,22 +273,22 @@ test("a typed prompt carries the Clarity note, which tells the main agent when t
 	});
 	assert.equal(run.status, 0, run.stderr);
 	const main = reached(workspace, "prompterize-test");
-	assert.equal(main.length, 1);
+	assert.equal(main.length, 1, "the prompt reached the main model once");
 	const request = main[0].system;
 	assert.match(request, /clear enough to act on/i, "the note asks the agent to judge the prompt's clarity");
 	assert.match(request, /proceed at once/i, "a clear prompt is acted on at once");
 	assert.match(request, /context makes the intent plain/i, "context can make the intent plain");
 	assert.match(request, /look up what you can/i, "the agent looks things up for itself first");
 	assert.match(request, /one Question round/i, "an unclear prompt gets one Question round");
-	assert.match(request, /numbered/i, "the Question round is numbered, as the grilling skill formats it");
+	assert.match(request, /numbered questions/i, "the Question round is numbered, as the grilling skill formats it");
 	assert.match(request, /suggested answer/i, "each question carries a suggested answer");
 	assert.match(request, /"yes"/, "yes accepts the suggested answers");
-	assert.match(request, /wait/i, "the agent waits for the answer before working");
+	assert.match(request, /wait for the answer/i, "the agent waits for the answer before working");
 	assert.match(request, /whole new feature or project/i, "a whole new feature or project is told apart");
 	assert.match(request, /grilling skill in full/i, "a whole new feature or project gets the full grilling skill");
 });
 
-test("a typed prompt starting with * reaches the main model with the * stripped and no Fixer call", () => {
+test("a typed prompt starting with * reaches the main model with the * stripped and no Fixer call or Clarity note", () => {
 	const workspace = makeWorkspace();
 	const typed = "*pleas fix teh bug in teh parser";
 	const run = runPi(workspace, typed, {
@@ -302,7 +302,7 @@ test("a typed prompt starting with * reaches the main model with the * stripped 
 	assert.doesNotMatch(main[0].system, /Clarity note/i, "a skipped prompt carries no Clarity note");
 });
 
-test("a slash command reaches pi untouched and is not sent to the Fixer", () => {
+test("a slash command reaches pi untouched, with no Fixer call and no Clarity note", () => {
 	const workspace = makeWorkspace();
 	const typed = "/model opencode-go/deepseek-v4.1-flash";
 	const run = runPi(workspace, typed, {
@@ -316,7 +316,7 @@ test("a slash command reaches pi untouched and is not sent to the Fixer", () => 
 	assert.doesNotMatch(main[0].system, /Clarity note/i, "a slash command carries no Clarity note");
 });
 
-test("a prompt from RPC is not sent to the Fixer", async () => {
+test("a prompt from RPC is not sent to the Fixer and carries no Clarity note", async () => {
 	const workspace = makeWorkspace();
 	const typed = "pleas fix teh bug from rpc";
 	const run = await runRpc(workspace, typed, {
@@ -330,7 +330,7 @@ test("a prompt from RPC is not sent to the Fixer", async () => {
 	assert.doesNotMatch(main[0].system, /Clarity note/i, "a prompt from RPC carries no Clarity note");
 });
 
-test("a prompt sent by another extension is not sent to the Fixer", async () => {
+test("a prompt sent by another extension is not sent to the Fixer and carries no Clarity note", async () => {
 	const workspace = makeWorkspace();
 	const typed = "pleas fix teh bug from an extension";
 	const run = await runRpc(workspace, "/prompterize-test-extension", {
@@ -381,7 +381,7 @@ test("the Fixer's model and thinking level come from the prompterize settings", 
 	assert.equal(fixer[0].reasoning, "high", "the thinking level named in the settings");
 });
 
-test("turning the Fixer off sends typed prompts to the main model unchanged", () => {
+test("turning the Fixer off sends typed prompts to the main model unchanged, with the Clarity note still on", () => {
 	const settings = { prompterize: { fixer: { enabled: false } } };
 	const workspace = makeWorkspace({ settings });
 	const typed = "pleas fix teh bug in teh parser";
