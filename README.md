@@ -138,8 +138,8 @@ as typed with the real names close to it.
 message in `error` and the prompt as typed in `fixed`. A cancelled record carries the prompt as
 typed in `fixed`, no error, and the time waited in `durationMs`. A repo with no remote records
 `remote` as an empty string. Skipped prompts, slash commands, and prompts from RPC or another
-extension are not logged. Writing the log never stops or changes a prompt: when the file cannot be
-written, the prompt still goes on.
+extension are not logged as Fixer runs. Writing the log never stops or changes a prompt: when the
+file cannot be written, the prompt still goes on.
 
 When the Clarity note leads the main agent to ask a Question round, the Boss's next typed prompt
 is its answer, and the round is appended to the same file as a Question round record. The round is
@@ -166,7 +166,8 @@ round:
 be studied together. With the Fixer off there is no such record, so that field is left out and
 `prompt` holds the prompt itself. Each question keeps its body and suggested answer. A slash
 command, or a prompt from RPC or another extension, is not the Boss's next typed prompt, so the
-record waits for the next one.
+record waits for the next one. A typed prompt that starts with the Skip prefix still answers the
+round: the prefix changes only how the answer is sent, so it is left out of `answers`.
 
 ## Settings
 
