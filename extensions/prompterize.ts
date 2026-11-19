@@ -1,8 +1,8 @@
 /**
  * pi-prompterize: the Fixer sends each typed prompt to a cheap, fast model that fixes its
- * typos and maps near-miss file names to the repo's real names before the main agent reads it.
- * The Boss's words are the only thing that changes; nothing is added to the prompt to say what
- * changed.
+ * typos and maps near-miss file and symbol names to the repo's real names before the main agent
+ * reads it. The Boss's words are the only thing that changes; nothing is added to the prompt to
+ * say what changed.
  *
  * A typed prompt that was not skipped also gets the Clarity note in its run's system prompt,
  * so the main agent knows to act at once on a clear prompt and to ask one Question round
@@ -179,12 +179,12 @@ Rules:
 /**
  * The real names the Fixer's model is given, each beside the typed word it is close to, or nothing
  * when no word found a close name. Only these close matches go to the model: never the repo's
- * whole file list, and never the conversation.
+ * whole file list or symbol list, and never the conversation.
  */
 function realNameSection(matches: RealNameMatch[]): string {
 	if (matches.length === 0) return "";
 	const lines = matches.map(({ word, names }) => `- ${word}: ${names.join(", ")}`);
-	return `Real names from this repo that are close to words in the prompt (git's tracked files). A word may be a misspelling of one of its names:\n${lines.join("\n")}`;
+	return `Real names from this repo that are close to words in the prompt. A word may be a misspelling of one of its names:\n${lines.join("\n")}`;
 }
 
 /** The prompterize settings pi holds, before any default is filled in. */

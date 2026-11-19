@@ -3,14 +3,18 @@
  * real names close to it, so the Fixer's model can map a near miss to the name the repo really
  * uses. Only the close matches reach the model, never the whole list and never the conversation.
  *
- * The first source is git's tracked file list, which every repo has. A later Bead adds the symbols
- * from the repo's GitNexus index on top.
+ * There are two sources. Git's tracked file list answers in every repo. When the `gitnexus`
+ * command lists the current repo as indexed, the symbols from that index are offered alongside
+ * the paths, so a symbol typed without its underscores or capitals can find its real name. A
+ * repo with no index, a missing `gitnexus`, or a failing one falls back to git's files alone.
  *
  * The match is local and fuzzy: case, underscores, hyphens and dots are ignored, and a few wrong,
  * missing or extra letters are tolerated. A real name is compared by its whole path, its file name
  * and its file name without its extension, so a word typed without a path or an extension still
  * finds the file it names.
  */
+import { realpathSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** One word from the prompt that looks like a path or symbol, with the real names close to it. */
@@ -26,17 +30,62 @@ const MAX_NAMES = 5;
 const MIN_WORD_LENGTH = 4;
 
 /**
- * The close real names for every suspect word in `text`, from the files git tracks in `cwd`. One
- * entry per distinct word, in the order the words appear; each entry carries at most five names,
- * nearest first. A folder git cannot answer for offers no names rather than failing.
+ * The graph's symbol node labels, taken from GitNexus 1.6.12's own `SYMBOL_NODE_LABELS`: the node
+ * kinds it counts as a resolvable code symbol. Files and folders are left out because git already
+ * lists the paths, and sections and communities are prose and clusters rather than names to type.
+ */
+const SYMBOL_LABELS = [
+	"Function",
+	"Method",
+	"Class",
+	"Protocol",
+	"Category",
+	"Interface",
+	"CodeElement",
+	"Struct",
+	"Enum",
+	"Macro",
+	"Typedef",
+	"Union",
+	"Namespace",
+	"Trait",
+	"Impl",
+	"TypeAlias",
+	"Const",
+	"Static",
+	"Variable",
+	"Property",
+	"Record",
+	"Delegate",
+	"Annotation",
+	"Constructor",
+	"Template",
+	"Module",
+];
+
+/** The query whose one column holds every symbol name in the current repo's index. */
+const SYMBOL_QUERY = [
+	"MATCH (n)",
+	`WHERE labels(n) IN [${SYMBOL_LABELS.map((label) => `'${label}'`).join(", ")}]`,
+	"AND n.name IS NOT NULL",
+	"RETURN DISTINCT n.name AS name",
+].join(" ");
+
+/**
+ * The close real names for every suspect word in `text`, from git's tracked files in `cwd` and,
+ * when the repo is indexed, the symbols in its GitNexus index. One entry per distinct word, in the
+ * order the words appear; each entry carries at most five names, nearest first. A folder git or
+ * gitnexus cannot answer for offers no names of that kind rather than failing.
  */
 export async function closeRealNames(pi: ExtensionAPI, cwd: string, text: string): Promise<RealNameMatch[]> {
-	const names = await trackedFileNames(pi, cwd);
-	if (names.length === 0) return [];
+	const words = suspectWords(text);
+	if (words.length === 0) return [];
+	const [tracked, symbols] = await Promise.all([trackedFileNames(pi, cwd), indexedSymbolNames(pi, cwd)]);
+	const names = [...new Set([...tracked, ...symbols])];
 	const realNames: RealNameKeys[] = names.map((name) => ({ name, keys: matchKeys(name) }));
 	const matches: RealNameMatch[] = [];
 	const seen = new Set<string>();
-	for (const word of suspectWords(text)) {
+	for (const word of words) {
 		if (seen.has(word)) continue;
 		seen.add(word);
 		const close = closeNamesFor(normalise(word), realNames);
@@ -45,19 +94,93 @@ export async function closeRealNames(pi: ExtensionAPI, cwd: string, text: string
 	return matches;
 }
 
+/**
+ * The standard output of `command` run with `args` in `cwd`, or null when the command is missing,
+ * cannot start or exits non-zero. A lookup that cannot answer offers nothing rather than failing
+ * the Fixer, so every source of real names reads its command through this one place.
+ */
+async function commandOutput(
+	pi: ExtensionAPI,
+	command: string,
+	args: string[],
+	cwd: string,
+): Promise<string | null> {
+	try {
+		const result = await pi.exec(command, args, { cwd });
+		return result.code === 0 ? result.stdout : null;
+	} catch {
+		return null;
+	}
+}
+
 /** The paths git tracks in `cwd`, one per line; none when git cannot list them. */
 async function trackedFileNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
+	const listed = await commandOutput(pi, "git", ["ls-files"], cwd);
+	if (listed === null) return [];
+	return listed
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
+}
+
+/**
+ * The symbols in the current repo's GitNexus index, or none when the `gitnexus` command is
+ * missing or fails, or when its list of indexed repositories does not name this repo. The list is
+ * what says the index answers for this repo, so a repo absent from it falls back to git's files.
+ */
+async function indexedSymbolNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
+	const listed = await commandOutput(pi, "gitnexus", ["list"], cwd);
+	if (listed === null || !indexesRepo(listed, cwd)) return [];
+	const queried = await commandOutput(pi, "gitnexus", ["cypher", SYMBOL_QUERY], cwd);
+	return queried === null ? [] : symbolNamesIn(queried);
+}
+
+/** Whether the command's list of indexed repositories holds the repo that `cwd` sits in. */
+function indexesRepo(listOutput: string, cwd: string): boolean {
+	const here = canonicalPath(cwd);
+	return listedRepoPaths(listOutput).some((path) => {
+		const inside = relative(canonicalPath(path), here);
+		return inside === "" || (!inside.startsWith(`..${sep}`) && inside !== ".." && !isAbsolute(inside));
+	});
+}
+
+/** The repo paths in `gitnexus list`'s output, one per `Path:` line. */
+function listedRepoPaths(listOutput: string): string[] {
+	return [...listOutput.matchAll(/^\s*Path:\s+(.+?)\s*$/gm)].map((match) => match[1]);
+}
+
+/** `path` with its symlinks resolved, or made absolute when it cannot be read. */
+function canonicalPath(path: string): string {
 	try {
-		const listed = await pi.exec("git", ["ls-files"], { cwd });
-		if (listed.code !== 0) return [];
-		return listed.stdout
-			.split("\n")
-			.map((line) => line.trim())
-			.filter((line) => line.length > 0);
+		return realpathSync(path);
 	} catch {
-		// A repo git cannot answer for is a repo with no real names to offer, never a failed Fixer.
+		return resolve(path);
+	}
+}
+
+/**
+ * The one column of names in the markdown table `gitnexus cypher` prints, or none when the output
+ * is not that table. Its first two lines are the column name and the table's separator.
+ */
+function symbolNamesIn(output: string): string[] {
+	const start = output.search(/[[{]/);
+	if (start < 0) return [];
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(output.slice(start));
+	} catch {
 		return [];
 	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+	const markdown = (parsed as { markdown?: unknown }).markdown;
+	if (typeof markdown !== "string") return [];
+	return markdown
+		.split("\n")
+		.slice(2)
+		.map((line) => line.trim())
+		.filter((line) => line.startsWith("|") && line.endsWith("|"))
+		.map((line) => line.slice(1, -1).trim())
+		.filter((name) => name.length > 0 && !name.includes("|"));
 }
 
 /**
