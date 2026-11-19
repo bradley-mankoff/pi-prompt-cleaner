@@ -45,6 +45,7 @@ type Request = {
 	provider: string;
 	model: string;
 	reasoning: string | null;
+	sessionId: string | null;
 	system: string;
 	messages: string[];
 };
@@ -482,6 +483,17 @@ test("the Fixer uses opencode-go/deepseek-v4.1-flash at low thinking by default"
 	assert.equal(fixer.length, 1);
 	assert.equal(fixer[0].model, "deepseek-v4.1-flash", "the default Fixer model");
 	assert.equal(fixer[0].reasoning, "low", "the default thinking level");
+});
+
+test("the Fixer's model call carries the pi session's id, which opencode's providers need to route it", () => {
+	const workspace = makeWorkspace();
+	const run = runPi(workspace, "pleas fix teh bug in teh parser", {
+		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: "Please fix the bug in the parser.", changes: [] }),
+	});
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(fixer[0].sessionId, SESSION_ID, "the id pi gave this session");
 });
 
 test("the Fixer's model and thinking level come from the prompterize settings", () => {

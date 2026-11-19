@@ -26,7 +26,8 @@
  * The seam is the real pi session (see tests/prompterize.test.ts): this file wires pi's
  * `input`, `before_agent_start` and `agent_end` events to the Fixer, the Clarity note and the
  * Correction log, and the Fixer speaks to its model through `ctx.modelRegistry.streamSimple()`,
- * so pi's own credentials are used.
+ * so pi's own credentials are used. The call names the pi session's id, because opencode's
+ * providers answer 400 MissingSessionID unless the request carries a session to route by.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
@@ -563,7 +564,13 @@ async function fixPrompt(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string
 		};
 		const reply = await unlessAborted(
 			ctx.modelRegistry
-				.streamSimple(model, context, { reasoning: settings.thinkingLevel, signal: controller.signal })
+				.streamSimple(model, context, {
+					reasoning: settings.thinkingLevel,
+					// opencode's providers answer `400 MissingSessionID` to a request that names
+					// no session, so pi turns this id into the `x-opencode-session` header.
+					sessionId: ctx.sessionManager.getSessionId(),
+					signal: controller.signal,
+				})
 				.result(),
 			controller.signal,
 		);
