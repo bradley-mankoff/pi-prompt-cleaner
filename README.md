@@ -1,8 +1,8 @@
 # pi-prompterize
 
-Prepares each prompt you type into pi before the main agent reads it. The Fixer silently
-fixes the typos in a typed prompt and maps near-miss file names to the names the repo uses, and
-the Clarity note lets the main agent ask when a prompt is unclear. The main agent receives the
+Prepares each prompt you type into pi before the main agent reads it. The Fixer silently fixes
+the typos in a typed prompt and maps near-miss file and symbol names to the names the repo uses,
+and the Clarity note lets the main agent ask when a prompt is unclear. The main agent receives the
 fixed text, with no note of what changed.
 
 ## Install

@@ -86,7 +86,7 @@ type WorkspaceOptions = {
  * command is there at all. A workspace with no options gets a stub that lists no indexed repo,
  * so a test never reaches the Mac's own registry.
  */
-type GitnexusOptions = { indexesRepo?: boolean; symbols?: string[]; fails?: boolean; missing?: boolean };
+type GitnexusOptions = { indexesRepo?: boolean; symbols?: string[]; queryFails?: boolean; missing?: boolean };
 
 /** The remote a temporary repo has unless its test says otherwise. */
 const TEST_REMOTE = "https://example.com/boss/pi-prompterize-test.git";
@@ -166,7 +166,7 @@ function writeGitnexusStub(workspace: Workspace, options: GitnexusOptions): void
 	const config = {
 		listedRepo: options.indexesRepo === true ? workspace.repo.path : `${workspace.dir}-not-indexed`,
 		symbols: options.symbols ?? [],
-		fails: options.fails === true,
+		queryFails: options.queryFails === true,
 	};
 	const script = `#!${process.execPath}
 const config = ${JSON.stringify(config)};
@@ -191,7 +191,7 @@ if (command === "cypher") {
 	const result = { markdown, row_count: config.symbols.length };
 	process.stdout.write("  GitNexus Cypher (1.6.12)\\n" + JSON.stringify(result, null, 2) + "\\n");
 	// A failed query may still have printed rows: the exit code, not the output, says it failed.
-	process.exit(config.fails ? 1 : 0);
+	process.exit(config.queryFails ? 1 : 0);
 }
 process.stderr.write("unknown command " + command + "\\n");
 process.exit(1);
@@ -1012,7 +1012,7 @@ test("a repo gitnexus does not list as indexed falls back to git's tracked files
 test("a failing gitnexus falls back to git's tracked files, and the fixed prompt still reaches the main model", () => {
 	const workspace = makeWorkspace({
 		files: ["src/auth-session.ts"],
-		gitnexus: { indexesRepo: true, symbols: ["getUserById"], fails: true },
+		gitnexus: { indexesRepo: true, symbols: ["getUserById"], queryFails: true },
 	});
 	const fixed = "Please fix the auth-session.ts and getUserById check";
 	const run = runPi(workspace, "pleas fix the authsesion and getuserbyid check", {

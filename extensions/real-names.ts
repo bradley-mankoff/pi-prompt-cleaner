@@ -94,19 +94,33 @@ export async function closeRealNames(pi: ExtensionAPI, cwd: string, text: string
 	return matches;
 }
 
+/**
+ * The standard output of `command` run with `args` in `cwd`, or null when the command is missing,
+ * cannot start or exits non-zero. A lookup that cannot answer offers nothing rather than failing
+ * the Fixer, so every source of real names reads its command through this one place.
+ */
+async function commandOutput(
+	pi: ExtensionAPI,
+	command: string,
+	args: string[],
+	cwd: string,
+): Promise<string | null> {
+	try {
+		const result = await pi.exec(command, args, { cwd });
+		return result.code === 0 ? result.stdout : null;
+	} catch {
+		return null;
+	}
+}
+
 /** The paths git tracks in `cwd`, one per line; none when git cannot list them. */
 async function trackedFileNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
-	try {
-		const listed = await pi.exec("git", ["ls-files"], { cwd });
-		if (listed.code !== 0) return [];
-		return listed.stdout
-			.split("\n")
-			.map((line) => line.trim())
-			.filter((line) => line.length > 0);
-	} catch {
-		// A repo git cannot answer for is a repo with no real names to offer, never a failed Fixer.
-		return [];
-	}
+	const listed = await commandOutput(pi, "git", ["ls-files"], cwd);
+	if (listed === null) return [];
+	return listed
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
 }
 
 /**
@@ -115,20 +129,14 @@ async function trackedFileNames(pi: ExtensionAPI, cwd: string): Promise<string[]
  * what says the index answers for this repo, so a repo absent from it falls back to git's files.
  */
 async function indexedSymbolNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
-	try {
-		const listed = await pi.exec("gitnexus", ["list"], { cwd });
-		if (listed.code !== 0 || !listsRepo(listed.stdout, cwd)) return [];
-		const queried = await pi.exec("gitnexus", ["cypher", SYMBOL_QUERY], { cwd });
-		if (queried.code !== 0) return [];
-		return symbolNamesIn(queried.stdout);
-	} catch {
-		// A missing or broken gitnexus is a repo with no index to offer, never a failed Fixer.
-		return [];
-	}
+	const listed = await commandOutput(pi, "gitnexus", ["list"], cwd);
+	if (listed === null || !indexesRepo(listed, cwd)) return [];
+	const queried = await commandOutput(pi, "gitnexus", ["cypher", SYMBOL_QUERY], cwd);
+	return queried === null ? [] : symbolNamesIn(queried);
 }
 
 /** Whether the command's list of indexed repositories holds the repo that `cwd` sits in. */
-function listsRepo(listOutput: string, cwd: string): boolean {
+function indexesRepo(listOutput: string, cwd: string): boolean {
 	const here = canonicalPath(cwd);
 	return listedRepoPaths(listOutput).some((path) => {
 		const inside = relative(canonicalPath(path), here);
@@ -141,7 +149,7 @@ function listedRepoPaths(listOutput: string): string[] {
 	return [...listOutput.matchAll(/^\s*Path:\s+(.+?)\s*$/gm)].map((match) => match[1]);
 }
 
-/** `path` with symlinks resolved, or as given when it cannot be read. */
+/** `path` with its symlinks resolved, or made absolute when it cannot be read. */
 function canonicalPath(path: string): string {
 	try {
 		return realpathSync(path);
