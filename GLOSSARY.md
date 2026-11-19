@@ -13,7 +13,7 @@ The part that sends a typed prompt to a cheap, fast model and silently replaces 
 _Avoid_: rewriter, enhancer, optimizer
 
 **Real name**:
-A symbol from the repo's GitNexus index, or a file path from git's file list when the repo has no index, that the Fixer may map a typed word to.
+A symbol declared in the repo's working tree, harvested by ripgrep, or a file path from git's file list, that the Fixer may map a typed word to.
 _Avoid_: identifier, candidate
 
 **Protected span**:

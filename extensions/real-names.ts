@@ -3,18 +3,25 @@
  * real names close to it, so the Fixer's model can map a near miss to the name the repo really
  * uses. Only the close matches reach the model, never the whole list and never the conversation.
  *
- * There are two sources. Git's tracked file list answers in every repo. When the `gitnexus`
- * command lists the current repo as indexed, the symbols from that index are offered alongside
- * the paths, so a symbol typed without its underscores or capitals can find its real name. A
- * repo with no index, a missing `gitnexus`, or a failing one falls back to git's files alone.
+ * There are two sources. Git's file list answers in every repo, and it includes untracked files, so
+ * a file the agent just wrote counts. Ripgrep harvests declarations from the working tree in this
+ * process: functions, classes, interfaces, types, constants, class members, object-literal methods
+ * and properties, Python functions, classes, attributes and dict keys, and Swift types, functions
+ * and properties. The harvest reads the files as they are, so it needs no index, never goes stale,
+ * and answers in a git worktree as it does in the main checkout. A repo with no `rg`, or a failing
+ * one, falls back to git's files alone.
+ *
+ * The harvest reads declarations by their line, so a signature split across lines is not harvested,
+ * and a line that only looks like a declaration inside a comment or string is not matched because
+ * every pattern starts at the line's first non-space character.
  *
  * The match is local and fuzzy: case, underscores, hyphens and dots are ignored, and a few wrong,
  * missing or extra letters are tolerated. A real name is compared by its whole path, its file name
  * and its file name without its extension, so a word typed without a path or an extension still
  * finds the file it names.
  */
-import { realpathSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** One word from the prompt that looks like a path or symbol, with the real names close to it. */
@@ -29,59 +36,96 @@ const MAX_NAMES = 5;
 /** A word shorter than this is too likely to be an ordinary short word to look up. */
 const MIN_WORD_LENGTH = 4;
 
+/** The file types ripgrep is asked for, the languages the declaration patterns understand. */
+const SOURCE_TYPES = ["--type", "ts", "--type", "js", "--type", "py", "--type", "swift"];
+
+/** The extensions whose declarations the TypeScript/JavaScript patterns read. */
+const TYPESCRIPT_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue"]);
+
+/** The extensions whose declarations the Python patterns read. */
+const PYTHON_EXTENSIONS = new Set([".py", ".pyi"]);
+
 /**
- * The graph's symbol node labels, taken from GitNexus 1.6.12's own `SYMBOL_NODE_LABELS`: the node
- * kinds it counts as a resolvable code symbol. Files and folders are left out because git already
- * lists the paths, and sections and communities are prose and clusters rather than names to type.
+ * The lines worth reading from a source file, as a fast ripgrep pre-filter: a line that starts
+ * with a declaration keyword or modifier, a name and a type annotation, a member signature, a
+ * quoted object key, or a name and an assignment. The patterns below decide what each line
+ * declares; this one only keeps ripgrep from printing the rest of the file.
  */
-const SYMBOL_LABELS = [
-	"Function",
-	"Method",
-	"Class",
-	"Protocol",
-	"Category",
-	"Interface",
-	"CodeElement",
-	"Struct",
-	"Enum",
-	"Macro",
-	"Typedef",
-	"Union",
-	"Namespace",
-	"Trait",
-	"Impl",
-	"TypeAlias",
-	"Const",
-	"Static",
-	"Variable",
-	"Property",
-	"Record",
-	"Delegate",
-	"Annotation",
-	"Constructor",
-	"Template",
-	"Module",
-];
+const DECLARATION_LINE = String.raw`^\s*(?:(?:@\w+(?:\([^)\n]*\))?\s+)*(?:export|default|declare|abstract|async|public|private|protected|static|readonly|override|final|open|internal|fileprivate|mutating|nonmutating|convenience|required|indirect|lazy|weak|unowned|get|set|const|let|var|function|func|class|interface|type|typealias|enum|namespace|module|struct|protocol|extension|actor|trait|impl|def|fn|record|val)\b|^\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\??\s*:|^\s+[A-Za-z_$][A-Za-z0-9_$]*\s*(?:<[^()\n]*>)?\s*\(|^\s*[A-Za-z_][A-Za-z0-9_.]*\s*(?::[^=\n]+)?=|^\s*["'][^"']+["']\s*:)`;
 
-/** The query whose one column holds every symbol name in the current repo's index. */
-const SYMBOL_QUERY = [
-	"MATCH (n)",
-	`WHERE labels(n) IN [${SYMBOL_LABELS.map((label) => `'${label}'`).join(", ")}]`,
-	"AND n.name IS NOT NULL",
-	"RETURN DISTINCT n.name AS name",
-].join(" ");
+/** A TypeScript/JavaScript declaration keyword followed by the name it declares. */
+const TYPESCRIPT_DECLARATION =
+	/^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\s*\*?|class|interface|type|enum|namespace|const\s+enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)/;
+
+/** A top-level TypeScript/JavaScript binding, which is the only place a const/let/var is real. */
+const TYPESCRIPT_BINDING = /^(?:export\s+)?(?:declare\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)/;
+
+/** A TypeScript/JavaScript class field, interface member or object property written as `name:`. */
+const TYPESCRIPT_PROPERTY =
+	/^\s+(?:(?:public|private|protected|static|readonly|override|abstract|declare|async|get|set)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*\??\s*:/;
+
+/** A TypeScript/JavaScript class field or object property whose type is inferred from `=`. */
+const TYPESCRIPT_FIELD =
+	/^\s+(?:(?:public|private|protected|static|readonly|override|abstract|declare)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=\s*/;
+
+/** A TypeScript/JavaScript class or object method whose whole signature sits on one line. */
+const TYPESCRIPT_METHOD =
+	/^\s+(?:(?:public|private|protected|static|readonly|override|abstract|declare|async|get|set)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^()]*>)?\s*\([^)]*\)\s*(?::\s*[^;={]+)?\s*\{\s*$/;
+
+/** A TypeScript/JavaScript interface or type-literal method signature, which ends in a semicolon. */
+const TYPESCRIPT_SIGNATURE =
+	/^\s+(?:(?:readonly|new)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^()]*>)?\s*\([^)]*\)\s*(?::\s*[^;{}]+)?;\s*$/;
+
+/** A quoted object key, such as a key of a JavaScript object or a TypeScript type literal. */
+const TYPESCRIPT_QUOTED_KEY = /^\s+["']([^"']+)["']\s*:/;
+
+/** The words a one-line method pattern would otherwise read as a name. */
+const TYPESCRIPT_METHOD_KEYWORDS = new Set(["if", "for", "while", "switch", "catch", "with", "constructor"]);
+
+/** The words a member pattern would otherwise read as an object key. */
+const TYPESCRIPT_PROPERTY_KEYWORDS = new Set(["default", "case", "else"]);
+
+/** A Python function or method, with or without `async`, and the name it declares. */
+const PYTHON_FUNCTION = /^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)/;
+
+/** A Python class and the name it declares. */
+const PYTHON_CLASS = /^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)/;
+
+/** A Python module-level binding, the only place a top-level name is declared by assignment. */
+const PYTHON_MODULE_BINDING = /^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=/;
+
+/** A Python attribute assigned through `self`, which declares an instance attribute. */
+const PYTHON_SELF_BINDING = /^\s+self\.([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=/;
+
+/** A Python assignment inside a class body, which declares a class attribute. */
+const PYTHON_CLASS_BINDING = /^\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=/;
+
+/** A Python dict key, the language's object-literal property. */
+const PYTHON_QUOTED_KEY = /^\s*["']([^"']+)["']\s*:/;
+
+/** A Swift function or method, with its access and mutation modifiers, and the name it declares. */
+const SWIFT_FUNCTION =
+	/^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:public|private|fileprivate|internal|open|static|class|final|mutating|nonmutating|override|convenience|required|indirect|lazy|weak|unowned)\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)/;
+
+/** A Swift type declaration and the name it declares. */
+const SWIFT_TYPE =
+	/^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:public|private|fileprivate|internal|open|final|indirect)\s+)*(?:class|struct|protocol|enum|actor|extension|typealias)\s+([A-Za-z_][A-Za-z0-9_]*)/;
+
+/** A Swift stored property or constant, which must be in a type's body to be a property. */
+const SWIFT_PROPERTY =
+	/^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:public|private|fileprivate|internal|open|static|final|lazy|weak|unowned|override|required)\s+)*(?:var|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*[:=]/;
 
 /**
- * The close real names for every suspect word in `text`, from git's tracked files in `cwd` and,
- * when the repo is indexed, the symbols in its GitNexus index. One entry per distinct word, in the
- * order the words appear; each entry carries at most five names, nearest first. A folder git or
- * gitnexus cannot answer for offers no names of that kind rather than failing.
+ * The close real names for every suspect word in `text`, from git's tracked and untracked files in
+ * `cwd` and from the declarations ripgrep harvests out of those files. One entry per distinct word,
+ * in the order the words appear; each entry carries at most five names, nearest first. A folder
+ * git or ripgrep cannot answer for offers no names of that kind rather than failing.
  */
 export async function closeRealNames(pi: ExtensionAPI, cwd: string, text: string): Promise<RealNameMatch[]> {
 	const words = suspectWords(text);
 	if (words.length === 0) return [];
-	const [tracked, symbols] = await Promise.all([trackedFileNames(pi, cwd), indexedSymbolNames(pi, cwd)]);
-	const names = [...new Set([...tracked, ...symbols])];
+	const [files, symbols] = await Promise.all([gitFileNames(pi, cwd), harvestedSymbolNames(pi, cwd)]);
+	const names = [...new Set([...files, ...symbols])];
 	const realNames: RealNameKeys[] = names.map((name) => ({ name, keys: matchKeys(name) }));
 	const matches: RealNameMatch[] = [];
 	const seen = new Set<string>();
@@ -113,74 +157,201 @@ async function commandOutput(
 	}
 }
 
-/** The paths git tracks in `cwd`, one per line; none when git cannot list them. */
-async function trackedFileNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
-	const listed = await commandOutput(pi, "git", ["ls-files"], cwd);
-	if (listed === null) return [];
-	return listed
+/**
+ * The standard output of ripgrep, or null when the command is missing, cannot start or fails.
+ * Ripgrep exits 1 when it finds no match, which is an answer rather than a failure, so that code
+ * comes back as an empty output.
+ */
+async function ripgrepOutput(pi: ExtensionAPI, args: string[], cwd: string): Promise<string | null> {
+	try {
+		const result = await pi.exec("rg", args, { cwd });
+		if (result.code === 0) return result.stdout;
+		return result.code === 1 ? "" : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The paths git tracks or leaves untracked in `cwd`, one per line, with ignored files left out;
+ * none when git cannot list them. `--others` is what makes a file the agent just wrote count.
+ * Outside a git repo, ripgrep's file list answers instead.
+ */
+async function gitFileNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
+	const listed = await commandOutput(pi, "git", ["ls-files", "--cached", "--others", "--exclude-standard"], cwd);
+	if (listed !== null) return nonEmptyLines(listed);
+	const files = await ripgrepOutput(pi, ["--files", "--no-messages"], cwd);
+	return files === null ? [] : nonEmptyLines(files);
+}
+
+/** The lines of `output` that hold something, trimmed. */
+function nonEmptyLines(output: string): string[] {
+	return output
 		.split("\n")
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0);
 }
 
 /**
- * The symbols in the current repo's GitNexus index, or none when the `gitnexus` command is
- * missing or fails, or when its list of indexed repositories does not name this repo. The list is
- * what says the index answers for this repo, so a repo absent from it falls back to git's files.
+ * The declaration names in the working tree under `cwd`, harvested by one ripgrep pass and read
+ * from the lines it matched. A file that has disappeared since ripgrep read it offers nothing,
+ * and a repo with no declarations answers with an empty list.
  */
-async function indexedSymbolNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
-	const listed = await commandOutput(pi, "gitnexus", ["list"], cwd);
-	if (listed === null || !indexesRepo(listed, cwd)) return [];
-	const queried = await commandOutput(pi, "gitnexus", ["cypher", SYMBOL_QUERY], cwd);
-	return queried === null ? [] : symbolNamesIn(queried);
-}
-
-/** Whether the command's list of indexed repositories holds the repo that `cwd` sits in. */
-function indexesRepo(listOutput: string, cwd: string): boolean {
-	const here = canonicalPath(cwd);
-	return listedRepoPaths(listOutput).some((path) => {
-		const inside = relative(canonicalPath(path), here);
-		return inside === "" || (!inside.startsWith(`..${sep}`) && inside !== ".." && !isAbsolute(inside));
-	});
-}
-
-/** The repo paths in `gitnexus list`'s output, one per `Path:` line. */
-function listedRepoPaths(listOutput: string): string[] {
-	return [...listOutput.matchAll(/^\s*Path:\s+(.+?)\s*$/gm)].map((match) => match[1]);
-}
-
-/** `path` with its symlinks resolved, or made absolute when it cannot be read. */
-function canonicalPath(path: string): string {
-	try {
-		return realpathSync(path);
-	} catch {
-		return resolve(path);
+async function harvestedSymbolNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
+	const output = await ripgrepOutput(
+		pi,
+		["--json", "--no-messages", ...SOURCE_TYPES, "-e", DECLARATION_LINE, "."],
+		cwd,
+	);
+	if (output === null) return [];
+	const names = new Set<string>();
+	for (const [path, lineNumbers] of matchedLines(output)) {
+		let text: string;
+		try {
+			text = readFileSync(join(cwd, path), "utf8");
+		} catch {
+			continue;
+		}
+		const lines = text.split("\n");
+		const extension = extensionOf(path);
+		for (const lineNumber of lineNumbers) {
+			const name = declaredNameAt(extension, lines, lineNumber - 1);
+			// A name too short to be a suspect word can never be matched, and only adds noise.
+			if (name !== undefined && normalise(name).length >= MIN_WORD_LENGTH) names.add(name);
+		}
 	}
+	return [...names];
+}
+
+/** The line numbers ripgrep matched, grouped by the file they are in. */
+function matchedLines(output: string): Map<string, number[]> {
+	const byPath = new Map<string, number[]>();
+	for (const line of output.split("\n")) {
+		if (line.length === 0) continue;
+		let event: unknown;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (typeof event !== "object" || event === null) continue;
+		const { type, data } = event as { type?: unknown; data?: { path?: { text?: unknown }; line_number?: unknown } };
+		if (type !== "match" || typeof data?.path?.text !== "string" || typeof data.line_number !== "number") continue;
+		const numbers = byPath.get(data.path.text) ?? [];
+		numbers.push(data.line_number);
+		byPath.set(data.path.text, numbers);
+	}
+	return byPath;
+}
+
+/** The file extension of `path`, in lower case, or the whole path when it has none. */
+function extensionOf(path: string): string {
+	const dot = path.lastIndexOf(".");
+	return dot < 0 ? path : path.slice(dot).toLowerCase();
+}
+
+/** The name the line at `index` declares in a file of `extension`, or none when it declares one. */
+function declaredNameAt(extension: string, lines: string[], index: number): string | undefined {
+	const line = lines[index];
+	if (line === undefined) return undefined;
+	if (TYPESCRIPT_EXTENSIONS.has(extension)) return typescriptNameAt(line, lines, index);
+	if (PYTHON_EXTENSIONS.has(extension)) return pythonNameAt(line, lines, index);
+	if (extension === ".swift") return swiftNameAt(line, lines, index);
+	return undefined;
+}
+
+/** The name one TypeScript or JavaScript line declares, or none. */
+function typescriptNameAt(line: string, lines: string[], index: number): string | undefined {
+	const declaration = TYPESCRIPT_DECLARATION.exec(line) ?? TYPESCRIPT_BINDING.exec(line);
+	if (declaration !== null) return declaration[1];
+	// A member is only a member when the block around it holds members. This is what keeps a
+	// function's parameters, which are `name: Type` lines too, out of the symbol list.
+	if (!opensObjectBody(enclosingOpener(lines, index))) return undefined;
+	const property = TYPESCRIPT_PROPERTY.exec(line);
+	if (property !== null && !TYPESCRIPT_PROPERTY_KEYWORDS.has(property[1])) return property[1];
+	const field = TYPESCRIPT_FIELD.exec(line);
+	if (field !== null && !TYPESCRIPT_PROPERTY_KEYWORDS.has(field[1])) return field[1];
+	const method = TYPESCRIPT_METHOD.exec(line);
+	if (method !== null && !TYPESCRIPT_METHOD_KEYWORDS.has(method[1])) return method[1];
+	const signature = TYPESCRIPT_SIGNATURE.exec(line);
+	if (signature !== null && !TYPESCRIPT_METHOD_KEYWORDS.has(signature[1])) return signature[1];
+	return TYPESCRIPT_QUOTED_KEY.exec(line)?.[1];
+}
+
+/** The name one Python line declares, or none. */
+function pythonNameAt(line: string, lines: string[], index: number): string | undefined {
+	const declaration = PYTHON_FUNCTION.exec(line) ?? PYTHON_CLASS.exec(line);
+	if (declaration !== null) return declaration[1];
+	if (indentationOf(line) === 0) {
+		const binding = PYTHON_MODULE_BINDING.exec(line);
+		if (binding !== null) return binding[1];
+	}
+	const selfBinding = PYTHON_SELF_BINDING.exec(line);
+	if (selfBinding !== null) return selfBinding[1];
+	// An assignment inside a class body is a class attribute; one inside a function or a module's
+	// block is a local, so the block above the line decides.
+	const classBinding = PYTHON_CLASS_BINDING.exec(line);
+	if (classBinding !== null && opensPythonClassBody(enclosingOpener(lines, index))) return classBinding[1];
+	return PYTHON_QUOTED_KEY.exec(line)?.[1];
+}
+
+/** The name one Swift line declares, or none. */
+function swiftNameAt(line: string, lines: string[], index: number): string | undefined {
+	const declaration = SWIFT_FUNCTION.exec(line) ?? SWIFT_TYPE.exec(line);
+	if (declaration !== null) return declaration[1];
+	// A var or let inside a function is a local; inside a type's body it is a property.
+	const property = SWIFT_PROPERTY.exec(line);
+	if (property !== null && (indentationOf(line) === 0 || opensSwiftTypeBody(enclosingOpener(lines, index)))) {
+		return property[1];
+	}
+	return undefined;
+}
+
+/** The number of leading spaces and tabs on `line`, which is how nested blocks are told apart. */
+function indentationOf(line: string): number {
+	return line.length - line.trimStart().length;
+}
+
+/** The nearest line above `index` with a smaller indentation, which opened its block, or none. */
+function enclosingOpener(lines: string[], index: number): string | undefined {
+	const indentation = indentationOf(lines[index]);
+	for (let above = index - 1; above >= 0; above -= 1) {
+		if (lines[above].trim().length === 0) continue;
+		if (indentationOf(lines[above]) < indentation) return lines[above].trim();
+	}
+	return undefined;
 }
 
 /**
- * The one column of names in the markdown table `gitnexus cypher` prints, or none when the output
- * is not that table. Its first two lines are the column name and the table's separator.
+ * Whether `line` opens a block that holds class, interface, type or object members rather than
+ * statements: `class X {`, `interface X {`, `type X = {`, `const x = {`, `foo({`, `return {`.
+ * A function, method, arrow or control block holds statements, so a `name: Type` line in it is a
+ * parameter or a label rather than a member.
  */
-function symbolNamesIn(output: string): string[] {
-	const start = output.search(/[[{]/);
-	if (start < 0) return [];
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(output.slice(start));
-	} catch {
-		return [];
-	}
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
-	const markdown = (parsed as { markdown?: unknown }).markdown;
-	if (typeof markdown !== "string") return [];
-	return markdown
-		.split("\n")
-		.slice(2)
-		.map((line) => line.trim())
-		.filter((line) => line.startsWith("|") && line.endsWith("|"))
-		.map((line) => line.slice(1, -1).trim())
-		.filter((name) => name.length > 0 && !name.includes("|"));
+function opensObjectBody(line: string | undefined): boolean {
+	if (line === undefined) return true;
+	const body = line.trimEnd();
+	if (!body.endsWith("{")) return false;
+	const before = body.slice(0, -1).trimEnd();
+	if (/\b(?:class|interface|type|enum|namespace)\b/.test(before)) return true;
+	if (before === "" || before.endsWith("(") || before.endsWith("[") || before.endsWith(",")) return true;
+	if (before.endsWith("=") || before.endsWith(":") || /\breturn$/.test(before)) return true;
+	if (before.includes("=>") || before.endsWith(")")) return false;
+	if (/^(?:if|for|while|switch|catch|try|else|do|finally|function)\b/.test(before)) return false;
+	return true;
+}
+
+/** Whether `line` opens a Swift type's body, which is where a var or let is a property. */
+function opensSwiftTypeBody(line: string | undefined): boolean {
+	if (line === undefined || !line.endsWith("{")) return false;
+	return /^(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:public|private|fileprivate|internal|open|final|indirect)\s+)*(?:class|struct|protocol|enum|extension|actor)\b/.test(
+		line,
+	);
+}
+
+/** Whether `line` opens a Python class's body, which is where an assignment is a class attribute. */
+function opensPythonClassBody(line: string | undefined): boolean {
+	return line !== undefined && /^class\b/.test(line);
 }
 
 /**
