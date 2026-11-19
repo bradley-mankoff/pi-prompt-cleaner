@@ -17,8 +17,9 @@
  * large generated file or a very large tree cannot hang a prompt.
  *
  * The harvest reads declarations by their line, so a signature split across lines is not harvested,
- * and a line that only looks like a declaration inside a comment or string is not matched because
- * every pattern starts at the line's first non-space character.
+ * and a commented-out declaration is not matched because every pattern needs its keyword at the
+ * line's first non-space character. A declaration-shaped line at the left edge of a multi-line
+ * string is still harvested, so a name that appears only in string content can be offered.
  *
  * The match is local and fuzzy: case, underscores, hyphens and dots are ignored, and a few wrong,
  * missing or extra letters are tolerated. A real name is compared by its whole path, its file name
@@ -34,6 +35,9 @@ export type RealNameMatch = { word: string; names: string[] };
 
 /** One real name, with the forms of it that a typed word is matched against. */
 type RealNameKeys = { name: string; keys: string[] };
+
+/** What a command answered: its exit code, and the standard output it printed before it ended. */
+type CommandAnswer = { code: number; stdout: string };
 
 /** How many close real names one word may carry to the Fixer's model. */
 const MAX_NAMES = 5;
@@ -62,7 +66,7 @@ const PYTHON_EXTENSIONS = new Set([".py", ".pyi"]);
  * quoted object key, or a name and an assignment. The patterns below decide what each line
  * declares; this one only keeps ripgrep from printing the rest of the file.
  */
-const DECLARATION_LINE = String.raw`^\s*(?:(?:@\w+(?:\([^)\n]*\))?\s+)*(?:export|default|declare|abstract|async|public|private|protected|static|readonly|override|final|open|internal|fileprivate|mutating|nonmutating|convenience|required|indirect|lazy|weak|unowned|get|set|const|let|var|function|func|class|interface|type|typealias|enum|namespace|module|struct|protocol|extension|actor|trait|impl|def|fn|record|val)\b|^\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\??\s*:|^\s+[A-Za-z_$][A-Za-z0-9_$]*\s*(?:<[^()\n]*>)?\s*\(|^\s*[A-Za-z_][A-Za-z0-9_.]*\s*(?::[^=\n]+)?=|^\s*["'][^"']+["']\s*:)`;
+const DECLARATION_LINE = String.raw`^\s*(?:(?:@\w+(?:\([^)\n]*\))?\s+)*(?:export|default|declare|abstract|async|public|private|protected|static|readonly|override|final|open|internal|fileprivate|mutating|nonmutating|convenience|required|indirect|lazy|weak|unowned|get|set|const|let|var|function|func|class|interface|type|typealias|enum|namespace|module|struct|protocol|extension|actor|trait|impl|def|fn|record|val)\b|\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\??\s*:|\s+[A-Za-z_$][A-Za-z0-9_$]*\s*(?:<[^()\n]*>)?\s*\(|[A-Za-z_][A-Za-z0-9_.]*\s*(?::[^=\n]+)?=|["'][^"']+["']\s*:)`;
 
 /** A TypeScript/JavaScript declaration keyword followed by the name it declares. */
 const TYPESCRIPT_DECLARATION =
@@ -155,19 +159,22 @@ export async function closeRealNames(pi: ExtensionAPI, cwd: string, text: string
 }
 
 /**
- * The standard output of `command` run with `args` in `cwd`, or null when the command is missing,
- * cannot start or exits non-zero. A lookup that cannot answer offers nothing rather than failing
- * the Fixer.
+ * What `command` answered when run with `args` in `cwd`, or null when the command is missing,
+ * cannot start or is stopped at `timeout` milliseconds. A lookup that cannot answer offers nothing
+ * rather than failing the Fixer. The exit code comes back unread, so each source decides what its
+ * own codes mean: git calls any failure a non-zero code, while ripgrep answers 1 with no match and
+ * 2 with the matches it could read.
  */
-async function commandOutput(
+async function commandAnswer(
 	pi: ExtensionAPI,
 	command: string,
 	args: string[],
 	cwd: string,
-): Promise<string | null> {
+	timeout?: number,
+): Promise<CommandAnswer | null> {
 	try {
-		const result = await pi.exec(command, args, { cwd });
-		return result.code === 0 ? result.stdout : null;
+		const { code, stdout } = await pi.exec(command, args, { cwd, timeout });
+		return { code, stdout };
 	} catch {
 		return null;
 	}
@@ -181,13 +188,10 @@ async function commandOutput(
  * unreadable file. A run stopped at the harvest's timeout still carries the matches printed so far.
  */
 async function ripgrepOutput(pi: ExtensionAPI, args: string[], cwd: string): Promise<string | null> {
-	try {
-		const result = await pi.exec("rg", args, { cwd, timeout: HARVEST_TIMEOUT_MS });
-		if (result.code === 0 || result.code === 2) return result.stdout;
-		return result.code === 1 ? "" : null;
-	} catch {
-		return null;
-	}
+	const answer = await commandAnswer(pi, "rg", args, cwd, HARVEST_TIMEOUT_MS);
+	if (answer === null) return null;
+	if (answer.code === 0 || answer.code === 2) return answer.stdout;
+	return answer.code === 1 ? "" : null;
 }
 
 /**
@@ -196,8 +200,9 @@ async function ripgrepOutput(pi: ExtensionAPI, args: string[], cwd: string): Pro
  * `--others` is what makes a file the agent just wrote count.
  */
 async function gitFileNames(pi: ExtensionAPI, cwd: string): Promise<string[] | null> {
-	const listed = await commandOutput(pi, "git", ["ls-files", "--cached", "--others", "--exclude-standard"], cwd);
-	return listed === null ? null : nonEmptyLines(listed);
+	const answer = await commandAnswer(pi, "git", ["ls-files", "--cached", "--others", "--exclude-standard"], cwd);
+	if (answer === null || answer.code !== 0) return null;
+	return nonEmptyLines(answer.stdout);
 }
 
 /** The lines of `output` that hold something, trimmed. */
@@ -270,13 +275,13 @@ function matchedLines(output: string): Map<string, number[]> {
 	return byPath;
 }
 
-/** The file extension of `path`, in lower case, or the whole path when it has none. */
+/** The file extension of `path`, in lower case, or an empty string when it has none. */
 function extensionOf(path: string): string {
 	const dot = path.lastIndexOf(".");
-	return dot < 0 ? path : path.slice(dot).toLowerCase();
+	return dot < 0 ? "" : path.slice(dot).toLowerCase();
 }
 
-/** The name the line at `index` declares in a file of `extension`, or none when it declares one. */
+/** The name the line at `index` declares in a file of `extension`, or none when it declares no name. */
 function declaredNameAt(extension: string, lines: string[], index: number): string | undefined {
 	const line = lines[index];
 	if (line === undefined) return undefined;
@@ -352,7 +357,8 @@ function enclosingOpener(lines: string[], index: number): string | undefined {
  * Whether `line` opens a block that holds class, interface, type or object members rather than
  * statements: `class X {`, `interface X {`, `type X = {`, `const x = {`, `foo({`, `return {`.
  * A function, method, arrow or control block holds statements, so a `name: Type` line in it is a
- * parameter or a label rather than a member.
+ * parameter or a label rather than a member. With no opener above the line, such a line still
+ * counts as a member, so an indented line at the top of a file is not dropped.
  */
 function opensObjectBody(line: string | undefined): boolean {
 	if (line === undefined) return true;

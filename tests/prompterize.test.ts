@@ -168,14 +168,6 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 }
 
 /**
- * Put a command first on the workspace's PATH that cannot start, the way an uninstalled command
- * fails. It stands in for the harvest's outside edge: the Fixer must still offer git's paths.
- */
-function writeUnrunnableCommand(workspace: Workspace, name: string): void {
-	writeFileSync(join(workspace.bin, name), `#!/nonexistent/${name}\n`, { mode: 0o755 });
-}
-
-/**
  * The environment a pi process runs in: a temporary HOME and data folder, the workspace's own
  * commands first on PATH, the test provider's log, then `extra`. A test unsets XDG_DATA_HOME by
  * passing it as undefined.
@@ -1136,7 +1128,9 @@ test("a harvest that cannot run falls back to git's tracked paths, and the fixed
 		files: ["src/auth-session.ts"],
 		sources: { "src/session-store.ts": "export function renewSessionToken(): string {\n\treturn \"token\";\n}\n" },
 	});
-	writeUnrunnableCommand(workspace, "rg");
+	// A command whose interpreter is absent fails to start, exactly as an uninstalled ripgrep does,
+	// so the harvest takes the path a repo without ripgrep takes.
+	writeFileSync(join(workspace.bin, "rg"), "#!/nonexistent/rg\n", { mode: 0o755 });
 	const fixed = "Please fix the auth-session.ts check";
 	const run = runPi(workspace, "pleas fix the authsesion check", {
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [{ from: "authsesion", to: "auth-session.ts" }] }),
