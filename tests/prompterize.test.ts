@@ -10,15 +10,26 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+	javaScriptTypoCases,
+	pythonTypoCases,
+	swiftTypoCases,
+	typescriptTypoCases,
+	type TypoCase,
+} from "./fixtures/real-name-harvest/cases.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const extension = join(root, "extensions", "prompterize.ts");
 const testProvider = join(root, "tests", "fixtures", "prompterize-test-provider.ts");
+const harvestFixture = join(root, "tests", "fixtures", "real-name-harvest");
+
+/** The text of one source file from the real-name harvest fixture. */
+const fixtureSource = (name: string): string => readFileSync(join(harvestFixture, name), "utf8");
 
 /** The pi session id every test runs under, so a Correction log record's sessionId has a known value. */
 const SESSION_ID = "prompterize-test-session";
@@ -70,24 +81,16 @@ type Workspace = {
 
 /**
  * What a test sets up before pi runs: the settings pi reads, the repo's remote (null for none), the
- * files git tracks besides README.md, which are the real names the Fixer may offer, and the answers
- * the workspace's stub `gitnexus` command gives.
+ * files git tracks besides README.md, which are the real names the Fixer may offer, and the text of
+ * the tracked source files whose declarations the harvest reads. A `sources` file is tracked and
+ * committed with the rest; a test that wants an untracked file writes it after `makeWorkspace`.
  */
 type WorkspaceOptions = {
 	settings?: Record<string, unknown>;
 	remote?: string | null;
 	files?: string[];
-	gitnexus?: GitnexusOptions;
+	sources?: Record<string, string>;
 };
-
-/**
- * The stub `gitnexus` every workspace puts first on PATH, at the outside edge of the Fixer's
- * second real-name source: whether it names the workspace's repo in `list`, the symbols its
- * `cypher` answers with, whether that query fails after printing its rows, and whether the
- * command is there at all. A workspace with no options gets a stub that lists no indexed repo,
- * so a test never reaches the Mac's own registry.
- */
-type GitnexusOptions = { indexesRepo?: boolean; symbols?: string[]; queryFails?: boolean; missing?: boolean };
 
 /** The remote a temporary repo has unless its test says otherwise. */
 const TEST_REMOTE = "https://example.com/boss/pi-prompterize-test.git";
@@ -95,8 +98,12 @@ const TEST_REMOTE = "https://example.com/boss/pi-prompterize-test.git";
 /** Every workspace this file made, removed once its tests are done. */
 const workspaces: Workspace[] = [];
 
+/** Every folder outside a git repo this file made, removed once its tests are done. */
+const outsideDirs: string[] = [];
+
 after(() => {
 	for (const workspace of workspaces) rmSync(workspace.dir, { recursive: true, force: true });
+	for (const dir of outsideDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 /** Run one git command in a test's repo and return its trimmed stdout, failing the test when git fails. */
@@ -119,16 +126,24 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 	writeFileSync(log, "");
 	if (options.settings !== undefined) writeFileSync(join(agentDir, "settings.json"), JSON.stringify(options.settings));
 	writeFileSync(join(dir, "README.md"), "# a temporary repo\n");
+	// The test's own folders and log stay out of the paths and declarations the Fixer reads, as a
+	// repo's build output would be ignored.
+	writeFileSync(join(dir, ".gitignore"), ["home/", "pi-agent/", "data/", "bin/", "worktree/", "requests.jsonl", ""].join("\n"));
 	// Each file a test names is a tracked real name, so the Fixer may offer it to its model.
 	const files = options.files ?? [];
 	for (const file of files) {
 		mkdirSync(dirname(join(dir, file)), { recursive: true });
 		writeFileSync(join(dir, file), "// a real file in the temporary repo\n");
 	}
+	// Each source file carries the declarations a test wants the harvest to read.
+	for (const [file, text] of Object.entries(options.sources ?? {})) {
+		mkdirSync(dirname(join(dir, file)), { recursive: true });
+		writeFileSync(join(dir, file), text);
+	}
 	git(dir, ["init", "--quiet", "--initial-branch=main"]);
 	const remote = options.remote === undefined ? TEST_REMOTE : options.remote;
 	if (remote !== null) git(dir, ["remote", "add", "origin", remote]);
-	git(dir, ["add", "README.md", ...files]);
+	git(dir, ["add", "README.md", ".gitignore", ...files, ...Object.keys(options.sources ?? {})]);
 	git(dir, [
 		"-c",
 		"user.name=prompterize test",
@@ -144,66 +159,18 @@ function makeWorkspace(options: WorkspaceOptions = {}): Workspace {
 		remote: remote ?? "",
 		commit: git(dir, ["rev-parse", "HEAD"]),
 	};
-	// Made after the commit, so the stub command a test writes is never one of the tracked files.
+	// Made after the commit, so the command a test writes is never one of the tracked files.
 	const bin = join(dir, "bin");
 	mkdirSync(bin, { recursive: true });
 	const workspace = { dir, home, agentDir, bin, data: join(dir, "data"), log, repo };
-	writeGitnexusStub(workspace, options.gitnexus ?? {});
 	workspaces.push(workspace);
 	return workspace;
 }
 
 /**
- * Write the stub `gitnexus` a workspace puts first on PATH. It answers `list` and `cypher` in the
- * real command's shape, so a test proves the Fixer reads an index without needing one on the Mac.
- * A stub whose interpreter is absent fails to start, exactly as an uninstalled command does.
- */
-function writeGitnexusStub(workspace: Workspace, options: GitnexusOptions): void {
-	const path = join(workspace.bin, "gitnexus");
-	if (options.missing === true) {
-		writeFileSync(path, "#!/nonexistent/gitnexus\n", { mode: 0o755 });
-		return;
-	}
-	const config = {
-		listedRepo: options.indexesRepo === true ? workspace.repo.path : `${workspace.dir}-not-indexed`,
-		symbols: options.symbols ?? [],
-		queryFails: options.queryFails === true,
-	};
-	const script = `#!${process.execPath}
-const config = ${JSON.stringify(config)};
-const command = process.argv[2];
-if (command === "list") {
-	process.stdout.write([
-		"",
-		"  GitNexus List (1.6.12)",
-		"",
-		"  Indexed Repositories (1)",
-		"",
-		"  pi-prompterize-test",
-		"    Path:    " + config.listedRepo,
-		"    Indexed: 2026-11-18, 5:24:38 PM",
-		"    Commit:  abc1234",
-		"",
-	].join("\\n") + "\\n");
-	process.exit(0);
-}
-if (command === "cypher") {
-	const markdown = ["| name |", "| --- |", ...config.symbols.map((name) => "| " + name + " |")].join("\\n");
-	const result = { markdown, row_count: config.symbols.length };
-	process.stdout.write("  GitNexus Cypher (1.6.12)\\n" + JSON.stringify(result, null, 2) + "\\n");
-	// A failed query may still have printed rows: the exit code, not the output, says it failed.
-	process.exit(config.queryFails ? 1 : 0);
-}
-process.stderr.write("unknown command " + command + "\\n");
-process.exit(1);
-`;
-	writeFileSync(path, script, { mode: 0o755 });
-}
-
-/**
- * The environment a pi process runs in: a temporary HOME and data folder, the workspace's stub
- * `gitnexus` first on PATH so no test reaches the Mac's own index, the test provider's log, then
- * `extra`. A test unsets XDG_DATA_HOME by passing it as undefined.
+ * The environment a pi process runs in: a temporary HOME and data folder, the workspace's own
+ * commands first on PATH, the test provider's log, then `extra`. A test unsets XDG_DATA_HOME by
+ * passing it as undefined.
  */
 const piEnv = (
 	workspace: Workspace,
@@ -225,9 +192,9 @@ const piEnv = (
 type PiOutput = { status: number | null; stdout: string; stderr: string };
 
 /** A pi session in print mode with the extension, the test provider and one typed prompt. */
-function runPi(workspace: Workspace, prompt: string, env: Record<string, string | undefined> = {}): PiOutput {
+function runPi(workspace: Workspace, prompt: string, env: Record<string, string | undefined> = {}, cwd = workspace.dir): PiOutput {
 	const result = spawnSync("pi", [...SHARED_ARGS, "-p", prompt], {
-		cwd: workspace.dir,
+		cwd,
 		encoding: "utf8",
 		env: piEnv(workspace, env),
 	});
@@ -938,13 +905,74 @@ test("the Fixer's instructions tell its model to map a confidently meant word to
 });
 
 /**
- * The GitNexus tests: the same pi session seam, with a stub `gitnexus` first on PATH at the edge
- * of the Fixer's second real-name source. A test proves what the Fixer's model was offered and
- * what the main model received; it never reads how the lookup is built.
+ * The real-name harvest tests: the same pi session seam, with the repo's own working tree at the
+ * outside edge. The declarations in a source file are the symbols the Fixer may offer its model.
+ * A test proves what the Fixer's model was offered and what the main model received; it never
+ * reads how the lookup is built.
  */
 
-test("an indexed repo offers a symbol typed without its capitals or underscores to the Fixer's model, and the real symbol reaches the main model", () => {
-	const workspace = makeWorkspace({ gitnexus: { indexesRepo: true, symbols: ["getUserById"] } });
+/** The real names the Fixer's model was offered for `word`, nearest first. */
+function namesBeside(system: string, word: string): string[] {
+	const prefix = `- ${word}: `;
+	const line = system.split("\n").find((text) => text.startsWith(prefix));
+	return line === undefined ? [] : line.slice(prefix.length).split(", ");
+}
+
+/** Run one prompt through the Fixer and return the system prompt its model was sent. */
+function fixerSystemFor(workspace: Workspace, typed: string, cwd = workspace.dir): string {
+	const run = runPi(workspace, typed, { PROMPTERIZE_TEST_FIX: JSON.stringify({ text: typed, changes: [] }) }, cwd);
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	return fixer[0].system;
+}
+
+/** Assert that each typo case's real name is the first name offered for the word typed. */
+function assertRightNamesRankFirst(system: string, cases: TypoCase[]): void {
+	for (const { typed, realName } of cases) {
+		assert.equal(namesBeside(system, typed)[0], realName, `the first real name offered for ${typed}`);
+	}
+}
+
+/** A workspace whose repo holds the four source files of the typo fixture. */
+const makeHarvestWorkspace = (): Workspace =>
+	makeWorkspace({
+		sources: {
+			"src/store.ts": fixtureSource("store.ts"),
+			"src/layout.js": fixtureSource("layout.js"),
+			"src/archive.py": fixtureSource("archive.py"),
+			"src/badge.swift": fixtureSource("badge.swift"),
+		},
+	});
+
+test("the right TypeScript declaration or class member ranks first for each typo in the fixture", () => {
+	const workspace = makeHarvestWorkspace();
+	const typed = `check ${typescriptTypoCases.map(({ typed }) => typed).join(" ")} please`;
+	assertRightNamesRankFirst(fixerSystemFor(workspace, typed), typescriptTypoCases);
+});
+
+test("the right JavaScript object-literal method or property ranks first for each typo in the fixture", () => {
+	const workspace = makeHarvestWorkspace();
+	const typed = `check ${javaScriptTypoCases.map(({ typed }) => typed).join(" ")} please`;
+	assertRightNamesRankFirst(fixerSystemFor(workspace, typed), javaScriptTypoCases);
+});
+
+test("the right Python declaration, class member or dict key ranks first for each typo in the fixture", () => {
+	const workspace = makeHarvestWorkspace();
+	const typed = `check ${pythonTypoCases.map(({ typed }) => typed).join(" ")} please`;
+	assertRightNamesRankFirst(fixerSystemFor(workspace, typed), pythonTypoCases);
+});
+
+test("the right Swift declaration, property or method ranks first for each typo in the fixture", () => {
+	const workspace = makeHarvestWorkspace();
+	const typed = `check ${swiftTypoCases.map(({ typed }) => typed).join(" ")} please`;
+	assertRightNamesRankFirst(fixerSystemFor(workspace, typed), swiftTypoCases);
+});
+
+test("a symbol declared in a tracked file is offered to the Fixer's model, and the real symbol reaches the main model", () => {
+	const workspace = makeWorkspace({
+		sources: { "src/users.ts": "export function getUserById(id: string): string {\n\treturn id;\n}\n" },
+	});
 	const typed = "pleas fix the getuserbyid call";
 	const fixed = "Please fix the getUserById call";
 	const run = runPi(workspace, typed, {
@@ -954,18 +982,22 @@ test("an indexed repo offers a symbol typed without its capitals or underscores 
 	const fixer = reached(workspace, "opencode-go");
 	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
 	assert.equal(
-		linesBeside(fixer[0].system, "getuserbyid", "getUserById").length,
-		1,
-		"the GitNexus index's symbol was offered beside the word typed without its capitals or underscores",
+		namesBeside(fixer[0].system, "getuserbyid")[0],
+		"getUserById",
+		"the tracked declaration was offered beside the word typed without its capitals",
 	);
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1, "the prompt reached the main model once");
 	assert.equal(main[0].messages.at(-1), fixed, "the main model received the real symbol");
 });
 
-test("a half-remembered long symbol with several close matches in the index reaches the main model unchanged, followed by a possibly hint naming them", () => {
+test("a half-remembered long symbol with several close declarations reaches the main model unchanged, followed by a possibly hint naming them", () => {
 	const symbols = ["loadPromptCatalogFromDisk", "loadPromptCatalogFromDir", "loadPromptCatalogFromUrl"];
-	const workspace = makeWorkspace({ gitnexus: { indexesRepo: true, symbols } });
+	const sources = {
+		"src/catalog.ts":
+			symbols.map((name) => `export function ${name}(): string[] {\n\treturn [];\n}`).join("\n\n") + "\n",
+	};
+	const workspace = makeWorkspace({ sources });
 	const typed = "check the loadpromptcatalogfrom path";
 	const hinted =
 		"check the loadpromptcatalogfrom (possibly loadPromptCatalogFromDir or loadPromptCatalogFromUrl or loadPromptCatalogFromDisk) path";
@@ -983,81 +1015,122 @@ test("a half-remembered long symbol with several close matches in the index reac
 	assert.equal(run.status, 0, run.stderr);
 	const fixer = reached(workspace, "opencode-go");
 	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
-	for (const name of symbols) {
-		assert.equal(
-			linesBeside(fixer[0].system, "loadpromptcatalogfrom", name).length,
-			1,
-			`the Fixer's model saw ${name} beside the half-remembered word`,
-		);
-	}
+	assert.deepEqual(
+		namesBeside(fixer[0].system, "loadpromptcatalogfrom"),
+		["loadPromptCatalogFromDir", "loadPromptCatalogFromUrl", "loadPromptCatalogFromDisk"],
+		"each close declaration was offered beside the half-remembered word",
+	);
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1, "the prompt reached the main model once");
 	assert.equal(main[0].messages.at(-1), hinted, "the word stays as typed, followed by the possibly hint");
-	assert.match(
-		main[0].messages.at(-1) ?? "",
-		/\(possibly loadPromptCatalogFromDir or loadPromptCatalogFromUrl or loadPromptCatalogFromDisk\)/,
-		"the hint uses the word possibly and names the close matches",
-	);
 	assert.doesNotMatch(main[0].messages.at(-1) ?? "", /likely/i, "the hint never says likely");
 });
 
-test("a repo gitnexus does not list as indexed falls back to git's tracked files alone", () => {
-	const workspace = makeWorkspace({
-		files: ["src/auth-session.ts"],
-		gitnexus: { indexesRepo: false, symbols: ["getUserById"] },
-	});
-	const typed = "fix authsesion and getuserbyid";
-	const run = runPi(workspace, typed, {
-		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: typed, changes: [] }),
-	});
-	assert.equal(run.status, 0, run.stderr);
-	const fixer = reached(workspace, "opencode-go");
-	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+test("a declaration in an untracked file is harvested, so a file written after the commit is offered", () => {
+	const workspace = makeWorkspace();
+	const file = join(workspace.dir, "src", "fresh-helper.ts");
+	mkdirSync(dirname(file), { recursive: true });
+	writeFileSync(file, "export function freshlyWrittenHelper(): string {\n\treturn \"fresh\";\n}\n");
+	const system = fixerSystemFor(workspace, "check the freshlyWrittenHeler call");
 	assert.equal(
-		linesBeside(fixer[0].system, "authsesion", "src/auth-session.ts").length,
-		1,
-		"git's tracked path is still offered",
+		namesBeside(system, "freshlyWrittenHeler")[0],
+		"freshlyWrittenHelper",
+		"the untracked file's declaration is offered",
 	);
-	assert.equal(fixer[0].system.includes("getUserById"), false, "the repo the command does not list offers no symbol");
 });
 
-test("a failing gitnexus falls back to git's tracked files, and the fixed prompt still reaches the main model", () => {
+test("a session in a git worktree harvests the declarations in that worktree", () => {
 	const workspace = makeWorkspace({
-		files: ["src/auth-session.ts"],
-		gitnexus: { indexesRepo: true, symbols: ["getUserById"], queryFails: true },
+		sources: { "src/main-helper.ts": "export function mainCheckoutHelper(): string {\n\treturn \"main\";\n}\n" },
 	});
-	const fixed = "Please fix the auth-session.ts and getUserById check";
-	const run = runPi(workspace, "pleas fix the authsesion and getuserbyid check", {
-		PROMPTERIZE_TEST_FIX: JSON.stringify({
-			text: fixed,
-			changes: [
-				{ from: "authsesion", to: "auth-session.ts" },
-				{ from: "getuserbyid", to: "getUserById" },
-			],
-		}),
+	const worktree = join(workspace.dir, "worktree");
+	git(workspace.dir, ["worktree", "add", "--detach", worktree, "HEAD"]);
+	const file = join(worktree, "src", "worktree-helper.ts");
+	mkdirSync(dirname(file), { recursive: true });
+	writeFileSync(file, "export function onlyInWorktreeHelper(): string {\n\treturn \"worktree\";\n}\n");
+	git(worktree, ["add", "src/worktree-helper.ts"]);
+	git(worktree, [
+		"-c",
+		"user.name=prompterize test",
+		"-c",
+		"user.email=test@example.com",
+		"commit",
+		"--quiet",
+		"-m",
+		"a declaration that lives only in the worktree",
+	]);
+	const system = fixerSystemFor(workspace, "check the onlyinworktreehelper call", worktree);
+	assert.equal(
+		namesBeside(system, "onlyinworktreehelper")[0],
+		"onlyInWorktreeHelper",
+		"the worktree's declaration is offered",
+	);
+});
+
+test("a repo with one unreadable file still harvests the declarations in the files it can read", () => {
+	const workspace = makeWorkspace({
+		sources: {
+			"src/readable.ts": "export function goodHelperName(): string {\n\treturn \"good\";\n}\n",
+			"src/unreadable.ts": "export function secretHelperName(): string {\n\treturn \"secret\";\n}\n",
+		},
 	});
+	const unreadable = join(workspace.dir, "src", "unreadable.ts");
+	chmodSync(unreadable, 0o000);
+	try {
+		const system = fixerSystemFor(workspace, "check the goodHelerName call");
+		assert.equal(
+			namesBeside(system, "goodHelerName")[0],
+			"goodHelperName",
+			"a file ripgrep could not read does not throw away the harvest from the files it could",
+		);
+	} finally {
+		chmodSync(unreadable, 0o644);
+	}
+});
+
+test("a session in a folder outside a git repo does not scan it for declarations, and the prompt still reaches the main model", () => {
+	const workspace = makeWorkspace();
+	const outside = mkdtempSync(join(tmpdir(), "pi-prompterize-outside-"));
+	outsideDirs.push(outside);
+	// A folder outside a repo may hold anything, and a scan of it is unbounded: the stub records
+	// any ripgrep run, and the real command would print its whole output for the harvest to hold.
+	const marker = join(workspace.dir, "ripgrep-ran");
+	writeFileSync(join(workspace.bin, "rg"), `#!/bin/sh\necho ran >> ${marker}\nexit 1\n`, { mode: 0o755 });
+	const typed = "fix the someting call";
+	const fixed = "fix the something call";
+	const run = runPi(
+		workspace,
+		typed,
+		{ PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [{ from: "someting", to: "something" }] }) },
+		outside,
+	);
 	assert.equal(run.status, 0, run.stderr);
 	const fixer = reached(workspace, "opencode-go");
 	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
-	assert.equal(
-		linesBeside(fixer[0].system, "authsesion", "src/auth-session.ts").length,
-		1,
-		"git's tracked path is still offered",
-	);
-	assert.equal(
-		linesBeside(fixer[0].system, "getuserbyid", "getUserById").length,
-		0,
-		"a query that failed offers none of the rows it printed",
-	);
+	assert.equal(existsSync(marker), false, "a folder outside a git repo is not scanned for declarations");
+	assert.deepEqual(namesBeside(fixer[0].system, "someting"), [], "no real names come from outside a git repo");
 	const main = reached(workspace, "prompterize-test");
-	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt still reached the main model");
+	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt reached the main model");
 });
 
-test("a gitnexus command that cannot be run at all falls back to git's tracked files, and the fixed prompt still reaches the main model", () => {
+test("a repo with no declarations still offers git's tracked paths", () => {
+	const workspace = makeWorkspace({ files: ["src/auth-session.ts"] });
+	const system = fixerSystemFor(workspace, "check authsesion");
+	assert.equal(
+		namesBeside(system, "authsesion")[0],
+		"src/auth-session.ts",
+		"the tracked path is offered when the harvest finds nothing",
+	);
+});
+
+test("a harvest that cannot run falls back to git's tracked paths, and the fixed prompt still reaches the main model", () => {
 	const workspace = makeWorkspace({
 		files: ["src/auth-session.ts"],
-		gitnexus: { missing: true },
+		sources: { "src/session-store.ts": "export function renewSessionToken(): string {\n\treturn \"token\";\n}\n" },
 	});
+	// A command whose interpreter is absent fails to start, exactly as an uninstalled ripgrep does,
+	// so the harvest takes the path a repo without ripgrep takes.
+	writeFileSync(join(workspace.bin, "rg"), "#!/nonexistent/rg\n", { mode: 0o755 });
 	const fixed = "Please fix the auth-session.ts check";
 	const run = runPi(workspace, "pleas fix the authsesion check", {
 		PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [{ from: "authsesion", to: "auth-session.ts" }] }),
@@ -1066,39 +1139,40 @@ test("a gitnexus command that cannot be run at all falls back to git's tracked f
 	const fixer = reached(workspace, "opencode-go");
 	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
 	assert.equal(
-		linesBeside(fixer[0].system, "authsesion", "src/auth-session.ts").length,
-		1,
+		namesBeside(fixer[0].system, "authsesion")[0],
+		"src/auth-session.ts",
 		"git's tracked path is still offered",
 	);
+	assert.equal(fixer[0].system.includes("renewSessionToken"), false, "a harvest that failed offers no symbol");
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt still reached the main model");
 });
 
-test("in an indexed repo, symbols from the index and paths from git are matched together", () => {
+test("a path from git and a declaration harvested from a file are offered in the same request", () => {
 	const workspace = makeWorkspace({
 		files: ["src/auth-session.ts"],
-		gitnexus: { indexesRepo: true, symbols: ["getUserById"] },
+		sources: { "src/token-store.ts": "export function refreshAuthToken(): string {\n\treturn \"token\";\n}\n" },
 	});
-	const typed = "fix authsesion in the getuserbyid call";
-	const fixed = "fix auth-session.ts in the getUserById call";
+	const typed = "fix authsesion in refreshauthtoken";
+	const fixed = "fix auth-session.ts in refreshAuthToken";
 	const run = runPi(workspace, typed, {
 		PROMPTERIZE_TEST_FIX_SUBSTITUTIONS: JSON.stringify([
 			{ from: "authsesion", to: "auth-session.ts" },
-			{ from: "getuserbyid", to: "getUserById" },
+			{ from: "refreshauthtoken", to: "refreshAuthToken" },
 		]),
 	});
 	assert.equal(run.status, 0, run.stderr);
 	const fixer = reached(workspace, "opencode-go");
 	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
 	assert.equal(
-		linesBeside(fixer[0].system, "authsesion", "src/auth-session.ts").length,
-		1,
+		namesBeside(fixer[0].system, "authsesion")[0],
+		"src/auth-session.ts",
 		"the tracked path is offered for the word close to it",
 	);
 	assert.equal(
-		linesBeside(fixer[0].system, "getuserbyid", "getUserById").length,
-		1,
-		"the indexed symbol is offered for the word close to it, in the same request",
+		namesBeside(fixer[0].system, "refreshauthtoken")[0],
+		"refreshAuthToken",
+		"the harvested declaration is offered for the word close to it",
 	);
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.at(-1)?.messages.at(-1), fixed, "both real names reached the main model");
