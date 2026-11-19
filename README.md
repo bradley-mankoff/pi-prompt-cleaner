@@ -36,13 +36,18 @@ cleared however the call ends.
 
 ### Real names
 
-Before the Fixer's model call, real-name lookup reads two sources. Git's file list answers in every
-repo, tracked files and untracked ones alike, so a file an agent just wrote counts. Ripgrep then
-harvests the declarations in the working tree: functions, classes, interfaces, types, constants,
-class members and object-literal methods and properties, plus Python and Swift declarations. A
-symbol typed without its underscores or capitals, such as `getuserbyid`, can find `getUserById`.
-The harvest reads the files as they are, so it needs no index, never goes stale, and works inside
-a git worktree as well as the main checkout.
+Before the Fixer's model call, real-name lookup reads two sources. Git's file list answers inside a
+git repo, tracked files and untracked ones alike, so a file an agent just wrote counts. Ripgrep
+then harvests the declarations in the working tree: functions, classes, interfaces, types,
+constants, class members and object-literal methods and properties, plus Python and Swift
+declarations. A symbol typed without its underscores or capitals, such as `getuserbyid`, can find
+`getUserById`. The harvest reads the files as they are, so it needs no index, never goes stale,
+and works inside a git worktree as well as the main checkout. It reads only files under a
+megabyte and gives up after two seconds, so a generated file or a very large tree cannot hang
+the prompt.
+
+Outside a git repo there is no working tree to read, so the Fixer offers no real names and sends
+the prompt on as typed: it never scans a home folder.
 
 For each word in the prompt that looks like a path or symbol, it finds at most five real names
 close to it. The match ignores case, underscores, hyphens and dots, and allows a few wrong,

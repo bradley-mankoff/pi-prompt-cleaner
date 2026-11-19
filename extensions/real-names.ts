@@ -3,13 +3,18 @@
  * real names close to it, so the Fixer's model can map a near miss to the name the repo really
  * uses. Only the close matches reach the model, never the whole list and never the conversation.
  *
- * There are two sources. Git's file list answers in every repo, and it includes untracked files, so
- * a file the agent just wrote counts. Ripgrep harvests declarations from the working tree in this
- * process: functions, classes, interfaces, types, constants, class members, object-literal methods
- * and properties, Python functions, classes, attributes and dict keys, and Swift types, functions
- * and properties. The harvest reads the files as they are, so it needs no index, never goes stale,
- * and answers in a git worktree as it does in the main checkout. A repo with no `rg`, or a failing
- * one, falls back to git's files alone.
+ * There are two sources, both inside a git working tree. Git's file list answers, and it includes
+ * untracked files, so a file the agent just wrote counts. Ripgrep harvests declarations from the
+ * working tree in this process: functions, classes, interfaces, types, constants, class members,
+ * object-literal methods and properties, Python functions, classes, attributes and dict keys, and
+ * Swift types, functions and properties. The harvest reads the files as they are, so it needs no
+ * index, never goes stale, and answers in a git worktree as it does in the main checkout. A repo
+ * with no `rg`, or a failing one, falls back to git's files alone.
+ *
+ * A folder outside a git repo has no working tree to read, so it offers no real names and nothing
+ * scans it: a home folder can hold gigabytes, and no symbol in it is a real name for the Fixer.
+ * Inside a repo the harvest reads only files under a megabyte and stops after two seconds, so a
+ * large generated file or a very large tree cannot hang a prompt.
  *
  * The harvest reads declarations by their line, so a signature split across lines is not harvested,
  * and a line that only looks like a declaration inside a comment or string is not matched because
@@ -38,6 +43,12 @@ const MIN_WORD_LENGTH = 4;
 
 /** The file types ripgrep is asked for, the languages the declaration patterns understand. */
 const SOURCE_TYPES = ["--type", "ts", "--type", "js", "--type", "py", "--type", "swift"];
+
+/** The largest file the harvest reads: a bigger one is generated or minified, not hand-written. */
+const MAX_HARVEST_FILE_SIZE = "1M";
+
+/** How long ripgrep may run before the harvest gives up on it, in milliseconds. */
+const HARVEST_TIMEOUT_MS = 2000;
 
 /** The extensions whose declarations the TypeScript/JavaScript patterns read. */
 const TYPESCRIPT_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue"]);
@@ -119,12 +130,17 @@ const SWIFT_PROPERTY =
  * The close real names for every suspect word in `text`, from git's tracked and untracked files in
  * `cwd` and from the declarations ripgrep harvests out of those files. One entry per distinct word,
  * in the order the words appear; each entry carries at most five names, nearest first. A folder
- * git or ripgrep cannot answer for offers no names of that kind rather than failing.
+ * outside a git working tree has no names to offer, and a source that cannot answer subtracts
+ * itself rather than failing the Fixer.
  */
 export async function closeRealNames(pi: ExtensionAPI, cwd: string, text: string): Promise<RealNameMatch[]> {
 	const words = suspectWords(text);
 	if (words.length === 0) return [];
-	const [files, symbols] = await Promise.all([gitFileNames(pi, cwd), harvestedSymbolNames(pi, cwd)]);
+	const files = await gitFileNames(pi, cwd);
+	// No working tree means no real names: a scan of a folder outside a repo is unbounded and
+	// offers the Fixer nothing, so it is never started.
+	if (files === null) return [];
+	const symbols = await harvestedSymbolNames(pi, cwd);
 	const names = [...new Set([...files, ...symbols])];
 	const realNames: RealNameKeys[] = names.map((name) => ({ name, keys: matchKeys(name) }));
 	const matches: RealNameMatch[] = [];
@@ -141,7 +157,7 @@ export async function closeRealNames(pi: ExtensionAPI, cwd: string, text: string
 /**
  * The standard output of `command` run with `args` in `cwd`, or null when the command is missing,
  * cannot start or exits non-zero. A lookup that cannot answer offers nothing rather than failing
- * the Fixer, so every source of real names reads its command through this one place.
+ * the Fixer.
  */
 async function commandOutput(
 	pi: ExtensionAPI,
@@ -160,12 +176,14 @@ async function commandOutput(
 /**
  * The standard output of ripgrep, or null when the command is missing, cannot start or fails.
  * Ripgrep exits 1 when it finds no match, which is an answer rather than a failure, so that code
- * comes back as an empty output.
+ * comes back as an empty output. It exits 2 when some files could not be read but still prints
+ * every match from the files it could, so its output is used instead of thrown away over one
+ * unreadable file. A run stopped at the harvest's timeout still carries the matches printed so far.
  */
 async function ripgrepOutput(pi: ExtensionAPI, args: string[], cwd: string): Promise<string | null> {
 	try {
-		const result = await pi.exec("rg", args, { cwd });
-		if (result.code === 0) return result.stdout;
+		const result = await pi.exec("rg", args, { cwd, timeout: HARVEST_TIMEOUT_MS });
+		if (result.code === 0 || result.code === 2) return result.stdout;
 		return result.code === 1 ? "" : null;
 	} catch {
 		return null;
@@ -174,14 +192,12 @@ async function ripgrepOutput(pi: ExtensionAPI, args: string[], cwd: string): Pro
 
 /**
  * The paths git tracks or leaves untracked in `cwd`, one per line, with ignored files left out;
- * none when git cannot list them. `--others` is what makes a file the agent just wrote count.
- * Outside a git repo, ripgrep's file list answers instead.
+ * null when git cannot list them, which is how a folder outside a git working tree answers.
+ * `--others` is what makes a file the agent just wrote count.
  */
-async function gitFileNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
+async function gitFileNames(pi: ExtensionAPI, cwd: string): Promise<string[] | null> {
 	const listed = await commandOutput(pi, "git", ["ls-files", "--cached", "--others", "--exclude-standard"], cwd);
-	if (listed !== null) return nonEmptyLines(listed);
-	const files = await ripgrepOutput(pi, ["--files", "--no-messages"], cwd);
-	return files === null ? [] : nonEmptyLines(files);
+	return listed === null ? null : nonEmptyLines(listed);
 }
 
 /** The lines of `output` that hold something, trimmed. */
@@ -194,13 +210,23 @@ function nonEmptyLines(output: string): string[] {
 
 /**
  * The declaration names in the working tree under `cwd`, harvested by one ripgrep pass and read
- * from the lines it matched. A file that has disappeared since ripgrep read it offers nothing,
- * and a repo with no declarations answers with an empty list.
+ * from the lines it matched. The pass reads only files under a megabyte and gives up after two
+ * seconds. A file that has disappeared since ripgrep read it offers nothing, and a repo with no
+ * declarations answers with an empty list.
  */
 async function harvestedSymbolNames(pi: ExtensionAPI, cwd: string): Promise<string[]> {
 	const output = await ripgrepOutput(
 		pi,
-		["--json", "--no-messages", ...SOURCE_TYPES, "-e", DECLARATION_LINE, "."],
+		[
+			"--json",
+			"--no-messages",
+			...SOURCE_TYPES,
+			"--max-filesize",
+			MAX_HARVEST_FILE_SIZE,
+			"-e",
+			DECLARATION_LINE,
+			".",
+		],
 		cwd,
 	);
 	if (output === null) return [];

@@ -25,7 +25,7 @@ export const typescriptTypoCases: TypoCase[] = [
 /** JavaScript: an object literal's methods, properties and the binding that holds it. */
 export const javaScriptTypoCases: TypoCase[] = [
 	{ typed: "renderPromtBadge", realName: "renderPromptBadge" },
-	{ typed: "sidbarTitle", realName: "sidebarTitle" },
+	{ typed: "sidbarHeading", realName: "sidebarHeading" },
 	{ typed: "emptyArchveNotice", realName: "emptyArchiveNotice" },
 	{ typed: "promptlayuot", realName: "promptLayout" },
 ];

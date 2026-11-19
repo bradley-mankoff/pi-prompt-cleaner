@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -98,8 +98,12 @@ const TEST_REMOTE = "https://example.com/boss/pi-prompterize-test.git";
 /** Every workspace this file made, removed once its tests are done. */
 const workspaces: Workspace[] = [];
 
+/** Every folder outside a git repo this file made, removed once its tests are done. */
+const outsideDirs: string[] = [];
+
 after(() => {
 	for (const workspace of workspaces) rmSync(workspace.dir, { recursive: true, force: true });
+	for (const dir of outsideDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 /** Run one git command in a test's repo and return its trimmed stdout, failing the test when git fails. */
@@ -1027,6 +1031,7 @@ test("a half-remembered long symbol with several close declarations reaches the 
 	const main = reached(workspace, "prompterize-test");
 	assert.equal(main.length, 1, "the prompt reached the main model once");
 	assert.equal(main[0].messages.at(-1), hinted, "the word stays as typed, followed by the possibly hint");
+	assert.doesNotMatch(main[0].messages.at(-1) ?? "", /likely/i, "the hint never says likely");
 });
 
 test("a declaration in an untracked file is harvested, so a file written after the commit is offered", () => {
@@ -1068,6 +1073,52 @@ test("a session in a git worktree harvests the declarations in that worktree", (
 		"onlyInWorktreeHelper",
 		"the worktree's declaration is offered",
 	);
+});
+
+test("a repo with one unreadable file still harvests the declarations in the files it can read", () => {
+	const workspace = makeWorkspace({
+		sources: {
+			"src/readable.ts": "export function goodHelperName(): string {\n\treturn \"good\";\n}\n",
+			"src/unreadable.ts": "export function secretHelperName(): string {\n\treturn \"secret\";\n}\n",
+		},
+	});
+	const unreadable = join(workspace.dir, "src", "unreadable.ts");
+	chmodSync(unreadable, 0o000);
+	try {
+		const system = fixerSystemFor(workspace, "check the goodHelerName call");
+		assert.equal(
+			namesBeside(system, "goodHelerName")[0],
+			"goodHelperName",
+			"a file ripgrep could not read does not throw away the harvest from the files it could",
+		);
+	} finally {
+		chmodSync(unreadable, 0o644);
+	}
+});
+
+test("a session in a folder outside a git repo does not scan it for declarations, and the prompt still reaches the main model", () => {
+	const workspace = makeWorkspace();
+	const outside = mkdtempSync(join(tmpdir(), "pi-prompterize-outside-"));
+	outsideDirs.push(outside);
+	// A folder outside a repo may hold anything, and a scan of it is unbounded: the stub records
+	// any ripgrep run, and the real command would print its whole output for the harvest to hold.
+	const marker = join(workspace.dir, "ripgrep-ran");
+	writeFileSync(join(workspace.bin, "rg"), `#!/bin/sh\necho ran >> ${marker}\nexit 1\n`, { mode: 0o755 });
+	const typed = "fix the someting call";
+	const fixed = "fix the something call";
+	const run = runPi(
+		workspace,
+		typed,
+		{ PROMPTERIZE_TEST_FIX: JSON.stringify({ text: fixed, changes: [{ from: "someting", to: "something" }] }) },
+		outside,
+	);
+	assert.equal(run.status, 0, run.stderr);
+	const fixer = reached(workspace, "opencode-go");
+	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
+	assert.equal(existsSync(marker), false, "a folder outside a git repo is not scanned for declarations");
+	assert.deepEqual(namesBeside(fixer[0].system, "someting"), [], "no real names come from outside a git repo");
+	const main = reached(workspace, "prompterize-test");
+	assert.equal(main.at(-1)?.messages.at(-1), fixed, "the fixed prompt reached the main model");
 });
 
 test("a repo with no declarations still offers git's tracked paths", () => {
