@@ -164,11 +164,7 @@ function systemOf(context: Context): string {
 	return [context.systemPrompt ?? "", ...systemMessages].filter(Boolean).join("\n");
 }
 
-/**
- * The one request the log records, so a test can see what a model was sent. The session id is
- * recorded because opencode's providers need one: pi turns it into the `x-opencode-session`
- * header without which the provider answers 400 MissingSessionID.
- */
+/** The one request the log records, so a test can see what a model was sent. */
 function record(requested: Model<Api>, context: Context, options?: SimpleStreamOptions): void {
 	appendFileSync(
 		setting("PROMPTERIZE_TEST_LOG", "/dev/null"),

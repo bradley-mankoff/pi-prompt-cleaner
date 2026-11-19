@@ -566,8 +566,8 @@ async function fixPrompt(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string
 			ctx.modelRegistry
 				.streamSimple(model, context, {
 					reasoning: settings.thinkingLevel,
-					// opencode's providers reject a request that names no session with 400
-					// MissingSessionID: pi turns this id into their x-opencode-session header.
+					// opencode's providers answer `400 MissingSessionID` to a request that names
+					// no session, so pi turns this id into the `x-opencode-session` header.
 					sessionId: ctx.sessionManager.getSessionId(),
 					signal: controller.signal,
 				})

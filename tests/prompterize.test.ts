@@ -493,11 +493,7 @@ test("the Fixer's model call carries the pi session's id, which opencode's provi
 	assert.equal(run.status, 0, run.stderr);
 	const fixer = reached(workspace, "opencode-go");
 	assert.equal(fixer.length, 1, "the typed prompt reached the Fixer's model");
-	assert.equal(
-		fixer[0].sessionId,
-		SESSION_ID,
-		"the Fixer's model call carries the pi session's id, so an opencode provider can send its x-opencode-session header instead of answering 400 MissingSessionID",
-	);
+	assert.equal(fixer[0].sessionId, SESSION_ID, "the id pi gave this session");
 });
 
 test("the Fixer's model and thinking level come from the prompterize settings", () => {
