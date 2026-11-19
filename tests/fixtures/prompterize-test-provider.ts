@@ -16,8 +16,8 @@
  *
  * Each model has its own stream function, so neither has to ask which model it is playing.
  * Every request is written as one JSON object a line to PROMPTERIZE_TEST_LOG, with the
- * provider, model, thinking level, system prompt and message text, so a test can see what
- * each model received without reading inside the extension.
+ * provider, model, thinking level, session id, system prompt and message text, so a test can
+ * see what each model received without reading inside the extension.
  *
  * The settings above are read at request time, not at load time, so an in-process test can run
  * one pi session per case through a fresh environment. A request whose signal aborts ends with
@@ -164,7 +164,11 @@ function systemOf(context: Context): string {
 	return [context.systemPrompt ?? "", ...systemMessages].filter(Boolean).join("\n");
 }
 
-/** The one request the log records, so a test can see what a model was sent. */
+/**
+ * The one request the log records, so a test can see what a model was sent. The session id is
+ * recorded because opencode's providers need one: pi turns it into the `x-opencode-session`
+ * header without which the provider answers 400 MissingSessionID.
+ */
 function record(requested: Model<Api>, context: Context, options?: SimpleStreamOptions): void {
 	appendFileSync(
 		setting("PROMPTERIZE_TEST_LOG", "/dev/null"),
@@ -172,6 +176,7 @@ function record(requested: Model<Api>, context: Context, options?: SimpleStreamO
 			provider: requested.provider,
 			model: requested.id,
 			reasoning: options?.reasoning ?? null,
+			sessionId: options?.sessionId ?? null,
 			system: systemOf(context),
 			messages: context.messages.filter((message) => message.role !== "system").map(textOf),
 		})}\n`,
