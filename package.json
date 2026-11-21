@@ -1,5 +1,5 @@
 {
-  "name": "pi-prompterize",
+  "name": "pi-prompt-cleaner",
   "version": "0.1.0",
   "description": "Prepares each typed pi prompt before the main agent reads it: fixes typing, then lets the agent ask when the prompt is unclear.",
   "license": "MIT",
