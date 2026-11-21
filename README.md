@@ -1,4 +1,4 @@
-# pi-prompterize
+# pi-prompt-cleaner
 
 Prepares each prompt you type into pi before the main agent reads it. The Fixer silently fixes
 the typos in a typed prompt and maps near-miss file and symbol names to the names the repo uses,
@@ -8,13 +8,13 @@ fixed text, with no note of what changed.
 ## Install
 
 ```bash
-pi install git:github.com/bradley-mankoff/pi-prompterize
+pi install git:github.com/bradley-mankoff/pi-prompt-cleaner
 ```
 
 Or try it for one session without installing:
 
 ```bash
-pi -e ./pi-prompterize
+pi -e ./pi-prompt-cleaner
 ```
 
 The Fixer uses pi's own model credentials through `ctx.modelRegistry.streamSimple()`, so it
